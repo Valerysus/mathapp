@@ -1,5 +1,5 @@
 """
-MathLens — PyQt6 Desktop: захоплення екрана → OCR → SymPy (+ Gemini за запитом).
+MathLens - PyQt6 Desktop: захоплення екрана -> OCR -> SymPy (+ Gemini за запитом).
 Однофайлова збірка. Запуск: python mathlens.py
 """
 from __future__ import annotations
@@ -7,6 +7,7 @@ from __future__ import annotations
 import os
 import re
 import sys
+import shutil
 import traceback
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -25,9 +26,11 @@ GEMINI_MODEL   = os.getenv("GEMINI_MODEL", "gemini-2.0-flash").strip()
 DEFAULT_HOTKEY = os.getenv("HOTKEY", "F8").strip()
 DEFAULT_INTERVAL_S = int(os.getenv("AUTO_INTERVAL_S", "3"))
 OCR_LANG = os.getenv("OCR_LANG", "eng+ukr").strip()
-DEFAULT_FRAME = (200, 200, 720, 340)
+TESSERACT_CMD = os.getenv("TESSERACT_CMD", "").strip()
 OCR_MIN_CONF = 30
 SOLVER_CACHE_SIZE = 256
+DEFAULT_FRAME = (220, 220, 720, 320)
+
 
 # ------------------------------------------------------------------ imports
 import mss
@@ -47,7 +50,7 @@ from PyQt6.QtGui import QPainter, QColor, QPen, QFont
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QPushButton, QCheckBox, QSlider, QLabel,
     QInputDialog, QDialog, QVBoxLayout, QHBoxLayout, QTextBrowser,
-    QMessageBox,
+    QMessageBox, QFileDialog, QLineEdit, QFrame,
 )
 
 try:
@@ -55,6 +58,38 @@ try:
     _HAS_KEYBOARD = True
 except Exception:
     _HAS_KEYBOARD = False
+
+
+# ------------------------------------------------------------------ Tesseract
+def find_tesseract() -> str:
+    """Шукає tesseract у PATH або типових місцях встановлення."""
+    if TESSERACT_CMD and os.path.isfile(TESSERACT_CMD):
+        return TESSERACT_CMD
+    found = shutil.which("tesseract")
+    if found:
+        return found
+    candidates = [
+        r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+        r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+        "/opt/homebrew/bin/tesseract",
+        "/usr/local/bin/tesseract",
+        "/usr/bin/tesseract",
+    ]
+    for c in candidates:
+        if os.path.isfile(c):
+            return c
+    return ""
+
+
+_TESS_PATH = find_tesseract()
+if _TESS_PATH:
+    pytesseract.pytesseract.tesseract_cmd = _TESS_PATH
+
+
+def set_tesseract_path(path: str):
+    global _TESS_PATH
+    _TESS_PATH = path
+    pytesseract.pytesseract.tesseract_cmd = path
 
 
 # ==================================================================== OCR
@@ -266,7 +301,7 @@ def solve_line(line: str) -> Optional[dict]:
 
 # ============================================================== AI
 _AI_PROMPT = (
-    "Ти — стислий математичний репетитор.\n"
+    "Ти - стислий математичний репетитор.\n"
     "Поясни розв'язок виразу: \"{expression}\".\n"
     "Формат відповіді:\n"
     "1. Короткий результат.\n"
@@ -298,23 +333,130 @@ def explain(expression: str) -> str:
     return text.strip()
 
 
-# ============================================================== UI: FRAME
-class SelectionFrame(QWidget):
+# ============================================================== СТИЛІ
+STYLE_PANEL_BG   = "#000000"
+STYLE_TEXT       = "#ffffff"
+STYLE_TEXT_DIM   = "#888888"
+STYLE_BORDER     = "#333333"
+STYLE_BORDER_HI  = "#ffffff"
+
+PANEL_QSS = """
+QWidget#ControlPanel {
+    background: #000000;
+    color: #ffffff;
+}
+QLabel {
+    color: #ffffff;
+    font-size: 12px;
+}
+QLabel#TitleLabel {
+    color: #ffffff;
+    font-size: 16px;
+    font-weight: bold;
+    letter-spacing: 2px;
+}
+QLabel#StatusLabel {
+    color: #ffffff;
+    font-size: 11px;
+    padding: 4px 6px;
+    border: 1px solid #333333;
+}
+QLabel#HintLabel {
+    color: #888888;
+    font-size: 10px;
+}
+QPushButton {
+    background: #000000;
+    color: #ffffff;
+    border: 1px solid #ffffff;
+    padding: 6px 12px;
+    font-size: 12px;
+    border-radius: 0px;
+}
+QPushButton:hover {
+    background: #ffffff;
+    color: #000000;
+}
+QPushButton:pressed {
+    background: #cccccc;
+}
+QPushButton:disabled {
+    color: #555555;
+    border-color: #333333;
+}
+QPushButton#PrimaryButton {
+    background: #ffffff;
+    color: #000000;
+    border: 1px solid #ffffff;
+    padding: 10px 16px;
+    font-size: 13px;
+    font-weight: bold;
+    letter-spacing: 1px;
+}
+QPushButton#PrimaryButton:hover {
+    background: #000000;
+    color: #ffffff;
+}
+QCheckBox {
+    color: #ffffff;
+    font-size: 12px;
+    spacing: 8px;
+}
+QCheckBox::indicator {
+    width: 14px;
+    height: 14px;
+    border: 1px solid #ffffff;
+    background: #000000;
+}
+QCheckBox::indicator:checked {
+    background: #ffffff;
+}
+QSlider::groove:horizontal {
+    height: 2px;
+    background: #333333;
+}
+QSlider::handle:horizontal {
+    background: #ffffff;
+    width: 12px;
+    margin: -6px 0;
+    border-radius: 0px;
+}
+QLineEdit {
+    background: #000000;
+    color: #ffffff;
+    border: 1px solid #333333;
+    padding: 4px 6px;
+    font-size: 11px;
+}
+QTextBrowser {
+    background: #0a0a0a;
+    color: #ffffff;
+    border: 1px solid #333333;
+    font-size: 12px;
+}
+QDialog {
+    background: #000000;
+}
+"""
+
+
+# ============================================================== CAPTURE FRAME
+class CaptureFrame(QWidget):
+    """Тільки рамка захвату. Тягнеться за будь-яке місце, ресайзиться з країв."""
     roi_changed = pyqtSignal(QRect)
-    scan_requested = pyqtSignal()
-    auto_changed = pyqtSignal(bool, int)
-    hotkey_changed = pyqtSignal(str)
-    quit_requested = pyqtSignal()
 
-    HEADER_H = 44
-    MARGIN = 8
+    MARGIN = 14
+    MIN_W = 80
+    MIN_H = 60
 
-    def __init__(self, hotkey: str, interval: int):
-        super().__init__(None, Qt.WindowType.FramelessWindowHint
-                              | Qt.WindowType.WindowStaysOnTopHint)
+    def __init__(self):
+        super().__init__(None,
+            Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.Tool)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setMouseTracking(True)
-        self.setMinimumSize(520, 220)
+        self.setMinimumSize(self.MIN_W, self.MIN_H)
         self.resize(DEFAULT_FRAME[2], DEFAULT_FRAME[3])
         self.move(DEFAULT_FRAME[0], DEFAULT_FRAME[1])
 
@@ -322,109 +464,30 @@ class SelectionFrame(QWidget):
         self._resize_edge: Optional[str] = None
         self._start_geom = QRect()
         self._start_pos = QPoint()
-        self._hotkey = hotkey
-
-        self._build_controls(interval)
-        self._layout_header()
-
-    def _build_controls(self, interval: int):
-        self.hotkey_btn = QPushButton(f"🎯 {self._hotkey}", self)
-        self.hotkey_btn.clicked.connect(self._on_hotkey_clicked)
-
-        self.auto_chk = QCheckBox("Авто", self)
-        self.auto_chk.stateChanged.connect(self._emit_auto)
-
-        self.interval_slider = QSlider(Qt.Orientation.Horizontal, self)
-        self.interval_slider.setRange(1, 10)
-        self.interval_slider.setValue(int(interval))
-        self.interval_slider.setFixedWidth(90)
-        self.interval_slider.valueChanged.connect(self._emit_auto)
-
-        self.interval_lbl = QLabel(f"{interval}s", self)
-        self.interval_lbl.setFixedWidth(28)
-
-        self.scan_btn = QPushButton("Аналізувати", self)
-        self.scan_btn.clicked.connect(self.scan_requested.emit)
-
-        self.status_lbl = QLabel("● Готовий", self)
-
-        self.close_btn = QPushButton("✕", self)
-        self.close_btn.setFixedWidth(28)
-        self.close_btn.clicked.connect(self.quit_requested.emit)
-
-        self.scan_btn.setStyleSheet(
-            "QPushButton{background:#2563eb;color:#fff;border:0;"
-            "padding:5px 10px;border-radius:5px;font-size:12px;}"
-            "QPushButton:hover{background:#1d4ed8;}"
-        )
-        self.hotkey_btn.setStyleSheet(
-            "QPushButton{background:#0f172a;color:#cbd5e1;"
-            "border:1px solid #334155;padding:4px 8px;"
-            "border-radius:5px;font-size:12px;}"
-        )
-        self.close_btn.setStyleSheet(
-            "QPushButton{background:#7f1d1d;color:#fff;border:0;"
-            "border-radius:5px;padding:4px;font-size:12px;}"
-        )
-        self.auto_chk.setStyleSheet("QCheckBox{color:#cbd5e1;font-size:12px;}")
-        self.interval_lbl.setStyleSheet("color:#cbd5e1;font-size:12px;")
-        self.status_lbl.setStyleSheet("color:#22c55e;font-size:12px;")
-
-    def _layout_header(self):
-        y = (self.HEADER_H - 26) // 2
-        x = 10
-        for w, gap in [
-            (self.hotkey_btn, 8), (self.auto_chk, 8),
-            (self.interval_slider, 4), (self.interval_lbl, 10),
-            (self.scan_btn, 10),
-        ]:
-            w.adjustSize()
-            w.move(x, y + (26 - w.sizeHint().height()) // 2)
-            w.show()
-            x += w.sizeHint().width() + gap
-        self.close_btn.move(self.width() - 34, y)
-        self.status_lbl.adjustSize()
-        self.status_lbl.move(
-            max(x, self.width() - 210),
-            y + (26 - self.status_lbl.sizeHint().height()) // 2,
-        )
 
     def paintEvent(self, _):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        p.fillRect(0, 0, self.width(), self.HEADER_H, QColor(15, 23, 42, 240))
-        p.fillRect(0, self.HEADER_H - 1, self.width(), 1, QColor(37, 99, 235))
-        body = QRect(0, self.HEADER_H, self.width(),
-                     self.height() - self.HEADER_H)
-        p.fillRect(body, QColor(37, 99, 235, 30))
-        p.setPen(QPen(QColor(37, 99, 235), 2))
-        p.drawRect(self.rect().adjusted(1, 1, -2, -2))
+        r = self.rect()
+        # Напівпрозора чорна підкладка (щоб рамка читалась на будь-якому фоні)
+        p.fillRect(r, QColor(0, 0, 0, 30))
+        # Пунктирна біла рамка
+        pen = QPen(QColor(255, 255, 255), 1, Qt.PenStyle.DashLine)
+        p.setPen(pen)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawRect(r.adjusted(1, 1, -2, -2))
+        # Кутові квадрати (видимі "ручки")
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(255, 255, 255))
+        s = 8
+        w, h = self.width(), self.height()
+        for cx, cy in [(0, 0), (w - s, 0), (0, h - s), (w - s, h - s)]:
+            p.drawRect(cx, cy, s, s)
 
     def roi_rect(self) -> QRect:
-        return QRect(self.x(), self.y() + self.HEADER_H,
-                     self.width(), self.height() - self.HEADER_H)
+        return QRect(self.x(), self.y(), self.width(), self.height())
 
-    def set_status(self, text: str, color: str = "#22c55e"):
-        self.status_lbl.setText(f"● {text}")
-        self.status_lbl.setStyleSheet(f"color:{color};font-size:12px;")
-        self.status_lbl.adjustSize()
-        self._layout_header()
-
-    def _on_hotkey_clicked(self):
-        text, ok = QInputDialog.getText(
-            self, "Гаряча клавіша",
-            "Комбінація (F8, ctrl+alt+m, ...):", text=self._hotkey)
-        if ok and text.strip():
-            self._hotkey = text.strip()
-            self.hotkey_btn.setText(f"🎯 {self._hotkey}")
-            self.hotkey_changed.emit(self._hotkey)
-            self._layout_header()
-
-    def _emit_auto(self, *_):
-        self.interval_lbl.setText(f"{self.interval_slider.value()}s")
-        self.auto_changed.emit(self.auto_chk.isChecked(),
-                               self.interval_slider.value())
-
+    # ---------------------------------------------------- edge detection
     def _edge_at(self, pos: QPoint) -> Optional[str]:
         m = self.MARGIN
         w, h = self.width(), self.height()
@@ -453,7 +516,7 @@ class SelectionFrame(QWidget):
             "t":  Qt.CursorShape.SizeVerCursor,
             "b":  Qt.CursorShape.SizeVerCursor,
         }
-        self.setCursor(cursors.get(e, Qt.CursorShape.ArrowCursor))
+        self.setCursor(cursors.get(e, Qt.CursorShape.SizeAllCursor))
 
     def mousePressEvent(self, e):
         if e.button() != Qt.MouseButton.LeftButton:
@@ -488,13 +551,12 @@ class SelectionFrame(QWidget):
         if "r" in edge: g.setRight(g.right() + d.x())
         if "t" in edge: g.setTop(g.top() + d.y())
         if "b" in edge: g.setBottom(g.bottom() + d.y())
-        minw, minh = self.minimumWidth(), self.minimumHeight()
-        if g.width() < minw:
-            if "l" in edge: g.setLeft(g.right() - minw)
-            else: g.setRight(g.left() + minw)
-        if g.height() < minh:
-            if "t" in edge: g.setTop(g.bottom() - minh)
-            else: g.setBottom(g.top() + minh)
+        if g.width() < self.MIN_W:
+            if "l" in edge: g.setLeft(g.right() - self.MIN_W)
+            else: g.setRight(g.left() + self.MIN_W)
+        if g.height() < self.MIN_H:
+            if "t" in edge: g.setTop(g.bottom() - self.MIN_H)
+            else: g.setBottom(g.top() + self.MIN_H)
         self.setGeometry(g)
 
     def moveEvent(self, e):
@@ -503,17 +565,156 @@ class SelectionFrame(QWidget):
 
     def resizeEvent(self, e):
         super().resizeEvent(e)
-        self._layout_header()
         self.roi_changed.emit(self.roi_rect())
+
+
+# ============================================================== CONTROL PANEL
+class ControlPanel(QWidget):
+    """Окреме вікно з налаштуваннями."""
+    scan_requested = pyqtSignal()
+    auto_changed = pyqtSignal(bool, int)
+    hotkey_changed = pyqtSignal(str)
+    quit_requested = pyqtSignal()
+    tesseract_changed = pyqtSignal(str)
+
+    def __init__(self):
+        super().__init__(None)
+        self.setObjectName("ControlPanel")
+        self.setWindowTitle("MathLens")
+        self.setFixedWidth(420)
+        self.setStyleSheet(PANEL_QSS)
+
+        self._hotkey = DEFAULT_HOTKEY
+        self._build_ui()
+        self._refresh_tesseract_status()
+
+    def _build_ui(self):
+        root = QVBoxLayout(self)
+        root.setContentsMargins(16, 16, 16, 16)
+        root.setSpacing(12)
+
+        # Заголовок
+        title = QLabel("MATHLENS")
+        title.setObjectName("TitleLabel")
+        root.addWidget(title)
+
+        sub = QLabel("Screen OCR + SymPy + optional Gemini")
+        sub.setObjectName("HintLabel")
+        root.addWidget(sub)
+
+        root.addWidget(self._hsep())
+
+        # Tesseract
+        row_t = QHBoxLayout()
+        self.tess_status = QLabel("Tesseract: -")
+        self.tess_status.setObjectName("StatusLabel")
+        row_t.addWidget(self.tess_status, 1)
+        btn_browse = QPushButton("Browse")
+        btn_browse.clicked.connect(self._on_browse_tesseract)
+        row_t.addWidget(btn_browse)
+        root.addLayout(row_t)
+
+        # Hotkey
+        row_h = QHBoxLayout()
+        self.hotkey_btn = QPushButton(f"Hotkey: {self._hotkey}")
+        self.hotkey_btn.clicked.connect(self._on_hotkey_clicked)
+        row_h.addWidget(self.hotkey_btn, 1)
+        root.addLayout(row_h)
+
+        root.addWidget(self._hsep())
+
+        # Auto
+        row_a = QHBoxLayout()
+        self.auto_chk = QCheckBox("Auto scan")
+        self.auto_chk.stateChanged.connect(self._emit_auto)
+        row_a.addWidget(self.auto_chk)
+
+        self.interval_slider = QSlider(Qt.Orientation.Horizontal)
+        self.interval_slider.setRange(1, 10)
+        self.interval_slider.setValue(DEFAULT_INTERVAL_S)
+        self.interval_slider.valueChanged.connect(self._emit_auto)
+        row_a.addWidget(self.interval_slider, 1)
+
+        self.interval_lbl = QLabel(f"{DEFAULT_INTERVAL_S}s")
+        self.interval_lbl.setFixedWidth(30)
+        row_a.addWidget(self.interval_lbl)
+        root.addLayout(row_a)
+
+        root.addWidget(self._hsep())
+
+        # Scan button
+        self.scan_btn = QPushButton("ANALYZE")
+        self.scan_btn.setObjectName("PrimaryButton")
+        self.scan_btn.clicked.connect(self.scan_requested.emit)
+        root.addWidget(self.scan_btn)
+
+        # Status
+        self.status_lbl = QLabel("Ready")
+        self.status_lbl.setObjectName("StatusLabel")
+        root.addWidget(self.status_lbl)
+
+        # Quit
+        btn_quit = QPushButton("Quit")
+        btn_quit.clicked.connect(self.quit_requested.emit)
+        root.addWidget(btn_quit)
+
+        hint = QLabel("Hotkey scans current frame. Drag the white frame to position. "
+                      "Resize from any edge.")
+        hint.setObjectName("HintLabel")
+        hint.setWordWrap(True)
+        root.addWidget(hint)
+
+    @staticmethod
+    def _hsep() -> QFrame:
+        f = QFrame()
+        f.setFrameShape(QFrame.Shape.HLine)
+        f.setStyleSheet("color:#333333; background:#333333; max-height:1px;")
+        return f
+
+    # --------------------------------------------------------- status
+    def set_status(self, text: str):
+        self.status_lbl.setText(text)
+
+    def _refresh_tesseract_status(self):
+        if _TESS_PATH and os.path.isfile(_TESS_PATH):
+            self.tess_status.setText(f"Tesseract: OK")
+            self.tess_status.setToolTip(_TESS_PATH)
+        else:
+            self.tess_status.setText("Tesseract: NOT FOUND")
+            self.tess_status.setToolTip(
+                "Install Tesseract or click Browse to point to tesseract.exe")
+
+    def _on_browse_tesseract(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select tesseract executable", "",
+            "Tesseract (tesseract.exe tesseract);;All files (*)")
+        if path:
+            set_tesseract_path(path)
+            self._refresh_tesseract_status()
+            self.tesseract_changed.emit(path)
+
+    # --------------------------------------------------------- hotkey
+    def _on_hotkey_clicked(self):
+        text, ok = QInputDialog.getText(
+            self, "Hotkey", "Combination (F8, ctrl+alt+m, ...):",
+            text=self._hotkey)
+        if ok and text.strip():
+            self._hotkey = text.strip()
+            self.hotkey_btn.setText(f"Hotkey: {self._hotkey}")
+            self.hotkey_changed.emit(self._hotkey)
+
+    # --------------------------------------------------------- auto
+    def _emit_auto(self, *_):
+        self.interval_lbl.setText(f"{self.interval_slider.value()}s")
+        self.auto_changed.emit(self.auto_chk.isChecked(),
+                               self.interval_slider.value())
 
 
 # ============================================================== UI: BADGE
 class BadgeWindow(QWidget):
     clicked = pyqtSignal(dict)
-    COLOR_OK = "#16a34a"
-    COLOR_AI = "#d97706"
 
-    def __init__(self, data: dict, label: str, color: str):
+    def __init__(self, data: dict, label: str, is_solved: bool):
         super().__init__(None,
             Qt.WindowType.FramelessWindowHint
             | Qt.WindowType.WindowStaysOnTopHint
@@ -524,7 +725,7 @@ class BadgeWindow(QWidget):
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.data = data
         self._label = label
-        self._color = color
+        self._is_solved = is_solved
         f = QFont(); f.setPointSize(9); f.setBold(True)
         self.setFont(f)
         fm = self.fontMetrics()
@@ -534,11 +735,15 @@ class BadgeWindow(QWidget):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         r = self.rect().adjusted(0, 0, -1, -1)
-        p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QColor(self._color))
-        p.drawRoundedRect(r, 6, 6)
-        p.setPen(QColor("white"))
-        p.drawText(r, Qt.AlignmentFlag.AlignCenter, self._label)
+        if self._is_solved:
+            bg, fg, border = QColor(0, 0, 0, 235), QColor(255, 255, 255), QColor(255, 255, 255)
+        else:
+            bg, fg, border = QColor(255, 255, 255, 240), QColor(0, 0, 0), QColor(255, 255, 255)
+        p.setBrush(bg)
+        p.setPen(QPen(border, 1))
+        p.drawRoundedRect(r, 4, 4)
+        p.setPen(fg)
+        p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, self._label)
 
     def mousePressEvent(self, e):
         if e.button() == Qt.MouseButton.LeftButton:
@@ -565,8 +770,8 @@ class OverlayManager:
         self.clear()
         self._roi = QRect(roi)
         for it in items:
-            label, color = self._label_for(it)
-            b = BadgeWindow(it, label, color)
+            label, solved = self._label_for(it)
+            b = BadgeWindow(it, label, solved)
             b.clicked.connect(self._on_click)
             b.move(self._badge_pos(it))
             b.show()
@@ -577,12 +782,12 @@ class OverlayManager:
         return QPoint(self._roi.x() + x, self._roi.y() + y + h + 4)
 
     @staticmethod
-    def _label_for(item: dict) -> Tuple[str, str]:
+    def _label_for(item: dict) -> Tuple[str, bool]:
         sol = item.get("solution")
         if sol:
-            label = sol if len(sol) <= 24 else sol[:22] + "…"
-            return label, BadgeWindow.COLOR_OK
-        return "🤖 AI", BadgeWindow.COLOR_AI
+            label = sol if len(sol) <= 30 else sol[:28] + "..."
+            return label, True
+        return "ASK AI", False
 
 
 # ============================================================== AI WORKER
@@ -606,40 +811,48 @@ class DetailDialog(QDialog):
         super().__init__(parent)
         self.item = item
         self._worker: Optional[AIWorker] = None
-        self.setWindowTitle("Деталі виразу")
+        self.setWindowTitle("Details")
         self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+        self.setStyleSheet(PANEL_QSS)
         self.resize(560, 420)
 
         v = QVBoxLayout(self)
-        lbl = QLabel(f"<b>Вираз:</b> <code>{item['text']}</code>")
-        lbl.setTextFormat(Qt.TextFormat.RichText); lbl.setWordWrap(True)
+        v.setContentsMargins(16, 16, 16, 16)
+        v.setSpacing(10)
+
+        t = QLabel("EXPRESSION")
+        t.setObjectName("TitleLabel")
+        v.addWidget(t)
+
+        lbl = QLabel(f"<code>{item['text']}</code>")
+        lbl.setTextFormat(Qt.TextFormat.RichText)
+        lbl.setWordWrap(True)
         v.addWidget(lbl)
 
         sol = item.get("solution")
-        s = QLabel(f"<b>Локальний розв'язок:</b> {sol}" if sol
-                   else "<i>Локально не розв'язано. Спробуйте AI.</i>")
-        s.setTextFormat(Qt.TextFormat.RichText)
+        s = QLabel(f"LOCAL RESULT: {sol}" if sol
+                   else "LOCAL RESULT: not solved")
+        s.setObjectName("StatusLabel")
         v.addWidget(s)
 
         self.browser = QTextBrowser()
         v.addWidget(self.browser, 1)
 
         h = QHBoxLayout()
-        self.ai_btn = QPushButton("🤖 Пояснити з AI")
+        self.ai_btn = QPushButton("Ask Gemini")
         self.ai_btn.setEnabled(bool(GEMINI_API_KEY))
         self.ai_btn.clicked.connect(self._request_ai)
-        close_btn = QPushButton("Закрити")
+        close_btn = QPushButton("Close")
         close_btn.clicked.connect(self.accept)
         h.addWidget(self.ai_btn); h.addStretch(1); h.addWidget(close_btn)
         v.addLayout(h)
 
         if not GEMINI_API_KEY:
-            self.browser.setMarkdown(
-                "> **AI недоступний:** задайте `GEMINI_API_KEY` у `.env`.")
+            self.browser.setMarkdown("> GEMINI_API_KEY is not set in .env")
 
     def _request_ai(self):
         self.ai_btn.setEnabled(False)
-        self.browser.setMarkdown("_Запит до Gemini…_")
+        self.browser.setMarkdown("*Requesting Gemini...*")
         self._worker = AIWorker(self.item["text"], parent=self)
         self._worker.done.connect(self._on_done)
         self._worker.err.connect(self._on_err)
@@ -650,7 +863,7 @@ class DetailDialog(QDialog):
         self.browser.setMarkdown(text); self.ai_btn.setEnabled(True)
 
     def _on_err(self, msg: str):
-        self.browser.setMarkdown(f"**Помилка AI:** {msg}")
+        self.browser.setMarkdown(f"**AI error:** {msg}")
         self.ai_btn.setEnabled(True)
 
 
@@ -694,19 +907,20 @@ class HotkeyBridge(QObject):
 
 # ============================================================== CONTROLLER
 class App(QObject):
-    def __init__(self, app: QApplication):
+    def __init__(self, qapp: QApplication):
         super().__init__()
-        self.app = app
+        self.qapp = qapp
         self.pool = QThreadPool.globalInstance()
 
-        self.frame = SelectionFrame(DEFAULT_HOTKEY, DEFAULT_INTERVAL_S)
+        self.frame = CaptureFrame()
+        self.panel = ControlPanel()
         self.overlay = OverlayManager(on_click=self._show_details)
 
         self.frame.roi_changed.connect(self.overlay.set_roi)
-        self.frame.scan_requested.connect(self.start_scan)
-        self.frame.auto_changed.connect(self._on_auto_changed)
-        self.frame.hotkey_changed.connect(self._register_hotkey)
-        self.frame.quit_requested.connect(self.app.quit)
+        self.panel.scan_requested.connect(self.start_scan)
+        self.panel.auto_changed.connect(self._on_auto_changed)
+        self.panel.hotkey_changed.connect(self._register_hotkey)
+        self.panel.quit_requested.connect(self.qapp.quit)
 
         self._auto_timer = QTimer(self)
         self._auto_timer.timeout.connect(self.start_scan)
@@ -717,11 +931,17 @@ class App(QObject):
         self._register_hotkey(DEFAULT_HOTKEY)
 
         self.frame.show()
-        self.frame.set_status("Готовий", "#22c55e")
+        self.panel.show()
 
+        if not _TESS_PATH:
+            self.panel.set_status("Tesseract not found - install or browse")
+        else:
+            self.panel.set_status("Ready")
+
+    # --------------------------------------------------------- hotkey
     def _register_hotkey(self, hk: str):
         if not _HAS_KEYBOARD:
-            self.frame.set_status("keyboard недоступний", "#f59e0b")
+            self.panel.set_status("keyboard module unavailable")
             return
         try:
             if self._hotkey_handle is not None:
@@ -730,24 +950,37 @@ class App(QObject):
                 hk, self._bridge.triggered.emit)
         except Exception as e:
             QMessageBox.warning(
-                self.frame, "Хоткей",
-                f"Не вдалося зареєструвати '{hk}':\n{e}\n"
-                "На macOS/Linux може знадобитись sudo.")
+                self.panel, "Hotkey",
+                f"Failed to register '{hk}':\n{e}\n"
+                "Try running as administrator (Windows) or with sudo (Linux).")
 
+    # --------------------------------------------------------- auto
     def _on_auto_changed(self, enabled: bool, interval: int):
         self._auto_timer.stop()
         if enabled:
             self._auto_timer.start(max(1, interval) * 1000)
-            self.frame.set_status(f"Авто {interval}s", "#38bdf8")
+            self.panel.set_status(f"Auto every {interval}s")
         else:
-            self.frame.set_status("Готовий", "#22c55e")
+            self.panel.set_status("Ready")
 
+    # --------------------------------------------------------- scan
     def start_scan(self):
+        if not _TESS_PATH:
+            self.panel.set_status("Tesseract not found")
+            QMessageBox.warning(
+                self.panel, "Tesseract",
+                "Tesseract OCR is not installed or not in PATH.\n\n"
+                "Windows: install from https://github.com/UB-Mannheim/tesseract/wiki\n"
+                "macOS: brew install tesseract tesseract-lang\n"
+                "Linux: sudo apt install tesseract-ocr tesseract-ocr-ukr\n\n"
+                "Or click 'Browse' in the panel to point to tesseract executable.")
+            return
+
         roi = self.frame.roi_rect()
         if roi.width() < 30 or roi.height() < 20:
-            self.frame.set_status("Замала область", "#f59e0b")
+            self.panel.set_status("Frame too small")
             return
-        self.frame.set_status("Сканування…", "#eab308")
+        self.panel.set_status("Scanning...")
         task = ScanTask(roi)
         task.signals.done.connect(self._on_scan_done)
         task.signals.error.connect(self._on_scan_error)
@@ -757,14 +990,13 @@ class App(QObject):
         self.overlay.show_items(roi, items)
         solved = sum(1 for it in items if it.get("solution"))
         if not items:
-            self.frame.set_status("Нічого не знайдено", "#94a3b8")
+            self.panel.set_status("Nothing found")
         else:
-            self.frame.set_status(
-                f"{solved}/{len(items)} розв'язано", "#22c55e")
+            self.panel.set_status(f"{solved}/{len(items)} solved locally")
 
     def _on_scan_error(self, msg: str):
-        self.frame.set_status("Помилка", "#ef4444")
-        QMessageBox.warning(self.frame, "Помилка сканування", msg)
+        self.panel.set_status("Error")
+        QMessageBox.warning(self.panel, "Scan error", msg)
 
     def _show_details(self, item: dict):
         dlg = DetailDialog(item, parent=None)
