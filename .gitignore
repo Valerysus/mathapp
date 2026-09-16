@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+*.env.local
+build/
+dist/
+*.exe
+*.dmg
+*.app
+*.log
+deepseek_*
+*_dump_*
