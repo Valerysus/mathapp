@@ -1,0 +1,90 @@
+name: Build MathLens
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  source-zip:
+    name: Source ZIP
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prepare package
+        run: |
+          mkdir -p pkg/mathlens
+          cp mathlens.py requirements.txt .env.example README.md .gitignore pkg/mathlens/
+          cd pkg
+          zip -r mathlens-source.zip mathlens
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mathlens-source-zip
+          path: pkg/mathlens-source.zip
+          retention-days: 30
+
+  windows-exe:
+    name: Windows EXE
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Build exe
+        run: |
+          pyinstaller --noconfirm --clean --onefile --windowed `
+            --name MathLens `
+            --collect-all sympy `
+            --collect-all pytesseract `
+            --collect-all mss `
+            mathlens.py
+
+      - name: Zip the exe + .env.example
+        run: |
+          mkdir dist-pkg
+          copy dist\MathLens.exe dist-pkg\
+          copy .env.example dist-pkg\
+          Compress-Archive -Path dist-pkg\* -DestinationPath MathLens-windows.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mathlens-windows-exe
+          path: MathLens-windows.zip
+          retention-days: 30
+
+  release:
+    name: Release
+    needs: [source-zip, windows-exe]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Show artifacts
+        run: find artifacts -type f
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/mathlens-source-zip/*
+            artifacts/mathlens-windows-exe/*
+          generate_release_notes: true
