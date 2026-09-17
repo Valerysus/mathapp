@@ -1,1013 +1,1074 @@
 """
-MathLens - PyQt6 Desktop: захоплення екрана -> OCR -> SymPy (+ Gemini за запитом).
-Однофайлова збірка. Запуск: python mathlens.py
+MathLens v5 - Smart Math OCR, Local Equation Solver & Adaptive AI Explainer
+- Strict text filtering (ignores instruction sentences, numbers with dots, text paragraphs)
+- High-precision column-aware expression detection (splits multiple equations on one row)
+- Cyrillic math variable mapping (х -> x, у -> y, а -> a, : -> /)
+- Visual Bounding Boxes around detected problems
+- Local answer badge + separate [ ⚡ AI ] button
+- Adaptive AI explanation difficulty (Elementary, Medium, Advanced)
+- Dual-window architecture (Capture Frame + Taskbar Control Panel)
 """
-from __future__ import annotations
 
 import os
-import re
 import sys
+import re
 import shutil
-import traceback
-from collections import OrderedDict
-from dataclasses import dataclass
-from typing import List, Optional, Tuple, Dict
+from pathlib import Path
 
-# ------------------------------------------------------------------ dotenv
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except Exception:
-    pass
-
-# ------------------------------------------------------------------ config
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-GEMINI_MODEL   = os.getenv("GEMINI_MODEL", "gemini-2.0-flash").strip()
-DEFAULT_HOTKEY = os.getenv("HOTKEY", "F8").strip()
-DEFAULT_INTERVAL_S = int(os.getenv("AUTO_INTERVAL_S", "3"))
-OCR_LANG = os.getenv("OCR_LANG", "eng+ukr").strip()
-TESSERACT_CMD = os.getenv("TESSERACT_CMD", "").strip()
-OCR_MIN_CONF = 30
-SOLVER_CACHE_SIZE = 256
-DEFAULT_FRAME = (220, 220, 720, 320)
-
-
-# ------------------------------------------------------------------ imports
 import mss
-import pytesseract
-import sympy as sp
 from PIL import Image
+import pytesseract
+import sympy
 from sympy.parsing.sympy_parser import (
-    parse_expr, standard_transformations,
-    implicit_multiplication_application, convert_xor,
+    parse_expr,
+    standard_transformations,
+    implicit_multiplication_application,
 )
+import keyboard
+from dotenv import load_dotenv
 
-from PyQt6.QtCore import (
-    Qt, QRect, QPoint, pyqtSignal, QThread, QObject, QTimer,
-    QRunnable, QThreadPool,
-)
-from PyQt6.QtGui import QPainter, QColor, QPen, QFont
+from PyQt6.QtCore import Qt, QPoint, QRect, QRectF, pyqtSignal, QThread, QTimer, QObject
+from PyQt6.QtGui import QPainter, QPen, QColor, QBrush, QCursor, QFont
 from PyQt6.QtWidgets import (
-    QApplication, QWidget, QPushButton, QCheckBox, QSlider, QLabel,
-    QInputDialog, QDialog, QVBoxLayout, QHBoxLayout, QTextBrowser,
-    QMessageBox, QFileDialog, QLineEdit, QFrame,
+    QApplication,
+    QMainWindow,
+    QWidget,
+    QDialog,
+    QVBoxLayout,
+    QHBoxLayout,
+    QPushButton,
+    QCheckBox,
+    QSlider,
+    QLabel,
+    QLineEdit,
+    QTextBrowser,
+    QFileDialog,
+    QFrame,
 )
 
-try:
-    import keyboard
-    _HAS_KEYBOARD = True
-except Exception:
-    _HAS_KEYBOARD = False
+# ----------------------------------------------------------------------
+# Configuration & Auto-Detection
+# ----------------------------------------------------------------------
+ENV_PATH = Path(__file__).resolve().parent / ".env"
+load_dotenv(dotenv_path=ENV_PATH)
+
+DEFAULT_HOTKEY = os.getenv("HOTKEY", "F8").strip() or "F8"
+DEFAULT_INTERVAL = int(os.getenv("AUTO_INTERVAL_S", "3"))
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash").strip()
+GEMINI_FALLBACK_MODEL = "gemini-1.5-flash"
+OCR_LANG = os.getenv("OCR_LANG", "eng+ukr").strip()
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "AQ.Ab8RN6JSN12zl5DZ5p7ELzRtAy2Yx65DXP7PWYuAq9jWBg_ivg").strip()
 
 
-# ------------------------------------------------------------------ Tesseract
-def find_tesseract() -> str:
-    """Шукає tesseract у PATH або типових місцях встановлення."""
-    if TESSERACT_CMD and os.path.isfile(TESSERACT_CMD):
-        return TESSERACT_CMD
-    found = shutil.which("tesseract")
-    if found:
-        return found
+def find_tesseract_cmd() -> str:
+    custom = os.getenv("TESSERACT_CMD", "").strip()
+    if custom and os.path.isfile(custom):
+        return custom
+
+    which_path = shutil.which("tesseract")
+    if which_path:
+        return which_path
+
     candidates = [
-        r"C:\Program Files\Tesseract-OCR\tesseract.exe",
-        r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
-        "/opt/homebrew/bin/tesseract",
-        "/usr/local/bin/tesseract",
-        "/usr/bin/tesseract",
+        "D:/programs/tesseract.exe",
+        "D:/programs/Tesseract-OCR/tesseract.exe",
+        "D:/Tesseract-OCR/tesseract.exe",
+        "C:/Program Files/Tesseract-OCR/tesseract.exe",
+        "C:/Program Files (x86)/Tesseract-OCR/tesseract.exe",
+        "C:/Tesseract-OCR/tesseract.exe",
+        "E:/Tesseract-OCR/tesseract.exe",
+        os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs", "Tesseract-OCR", "tesseract.exe"),
+        os.path.join(os.environ.get("USERPROFILE", ""), "AppData", "Local", "Programs", "Tesseract-OCR", "tesseract.exe"),
     ]
-    for c in candidates:
-        if os.path.isfile(c):
-            return c
+    for p in candidates:
+        if p and os.path.isfile(p):
+            return p
     return ""
 
 
-_TESS_PATH = find_tesseract()
-if _TESS_PATH:
-    pytesseract.pytesseract.tesseract_cmd = _TESS_PATH
+TESSERACT_CMD = find_tesseract_cmd()
 
 
-def set_tesseract_path(path: str):
-    global _TESS_PATH
-    _TESS_PATH = path
-    pytesseract.pytesseract.tesseract_cmd = path
+def save_tesseract_cmd(path: str):
+    global TESSERACT_CMD
+    TESSERACT_CMD = path
+    lines = []
+    if ENV_PATH.exists():
+        with open(ENV_PATH, "r", encoding="utf-8") as f:
+            lines = f.readlines()
 
-
-# ==================================================================== OCR
-@dataclass
-class OCRItem:
-    text: str
-    left: int
-    top: int
-    width: int
-    height: int
-    confidence: float
-    line_id: Tuple[int, int, int]
-
-
-@dataclass
-class OCRLine:
-    text: str
-    left: int
-    top: int
-    width: int
-    height: int
-
-
-def capture_region(x: int, y: int, w: int, h: int) -> Image.Image:
-    if w <= 0 or h <= 0:
-        raise ValueError("Некоректні розміри області")
-    with mss.mss() as sct:
-        monitor = {"left": int(x), "top": int(y),
-                   "width": int(w), "height": int(h)}
-        shot = sct.grab(monitor)
-        return Image.frombytes("RGB", shot.size, shot.rgb)
-
-
-def ocr_image(img: Image.Image, lang: str, min_conf: int) -> List[OCRItem]:
-    data = pytesseract.image_to_data(
-        img, lang=lang, output_type=pytesseract.Output.DICT
-    )
-    items: List[OCRItem] = []
-    for i in range(len(data["text"])):
-        raw = (data["text"][i] or "").strip()
-        if not raw:
-            continue
-        try:
-            conf = float(data["conf"][i])
-        except (TypeError, ValueError):
-            conf = -1.0
-        if conf < min_conf:
-            continue
-        items.append(OCRItem(
-            text=raw,
-            left=int(data["left"][i]), top=int(data["top"][i]),
-            width=int(data["width"][i]), height=int(data["height"][i]),
-            confidence=conf,
-            line_id=(int(data["block_num"][i]),
-                     int(data["par_num"][i]),
-                     int(data["line_num"][i])),
-        ))
-    return items
-
-
-def group_lines(items: List[OCRItem]) -> List[OCRLine]:
-    buckets: Dict[Tuple[int, int, int], List[OCRItem]] = {}
-    for it in items:
-        buckets.setdefault(it.line_id, []).append(it)
-
-    lines: List[OCRLine] = []
-    for words in buckets.values():
-        words.sort(key=lambda w: w.left)
-        text = " ".join(w.text for w in words)
-        left = min(w.left for w in words)
-        top = min(w.top for w in words)
-        right = max(w.left + w.width for w in words)
-        bottom = max(w.top + w.height for w in words)
-        lines.append(OCRLine(text, left, top, right - left, bottom - top))
-    lines.sort(key=lambda l: (l.top, l.left))
-    return lines
-
-
-def read_screen(x: int, y: int, w: int, h: int,
-                lang: str, min_conf: int) -> List[OCRLine]:
-    img = capture_region(x, y, w, h)
-    return group_lines(ocr_image(img, lang=lang, min_conf=min_conf))
-
-
-# ============================================================== SOLVER
-_TRANSFORMS = standard_transformations + (
-    implicit_multiplication_application, convert_xor,
-)
-_SAFE_RE = re.compile(r"^[\s0-9a-zA-Z+\-*/^().,=]+$")
-_EQ_RE = re.compile(
-    r"[0-9a-zA-Z()\[\]{}\^+\-*/\s]{1,60}=\s*[0-9a-zA-Z()\[\]{}\^+\-*/\s]{1,60}"
-)
-_ARITH_RE = re.compile(r"\d[\d\s]*[-+*/^]\s*[\d\s()+\-*/^.]*\d")
-
-_CACHE: "OrderedDict[str, Optional[dict]]" = OrderedDict()
-
-_UNICODE_MAP = {"×": "*", "·": "*", "÷": "/", "−": "-", "–": "-", "—": "-",
-                "²": "^2", "³": "^3"}
-
-
-def _normalize(text: str) -> str:
-    s = text.strip()
-    for k, v in _UNICODE_MAP.items():
-        s = s.replace(k, v)
-    s = re.sub(r"\s+", "", s)
-    s = s.rstrip("?.")
-    s = s.rstrip("=")
-    return s
-
-
-def _cache_get(key: str):
-    if key in _CACHE:
-        _CACHE.move_to_end(key)
-        return _CACHE[key]
-    return "__MISS__"
-
-
-def _cache_put(key: str, value):
-    _CACHE[key] = value
-    _CACHE.move_to_end(key)
-    while len(_CACHE) > SOLVER_CACHE_SIZE:
-        _CACHE.popitem(last=False)
-
-
-def _fmt(v):
-    if getattr(v, "is_Integer", False):
-        return str(v)
-    if getattr(v, "is_Rational", False):
-        return sp.sstr(v)
-    if getattr(v, "is_Float", False):
-        return f"{float(v):.6g}"
-    return sp.sstr(v)
-
-
-def try_solve(text: str) -> Optional[dict]:
-    norm = _normalize(text)
-    if not norm or not _SAFE_RE.match(norm):
-        return None
-    cached = _cache_get(norm)
-    if cached != "__MISS__":
-        return cached
-    result: Optional[dict] = None
-    try:
-        if "=" in norm:
-            result = _solve_equation(norm, text)
+    found = False
+    new_lines = []
+    for line in lines:
+        if line.strip().startswith("TESSERACT_CMD="):
+            new_lines.append(f"TESSERACT_CMD={path}\n")
+            found = True
         else:
-            result = _solve_arithmetic(norm, text)
-    except Exception:
-        result = None
-    _cache_put(norm, result)
-    return result
+            new_lines.append(line)
+    if not found:
+        new_lines.append(f"TESSERACT_CMD={path}\n")
+
+    with open(ENV_PATH, "w", encoding="utf-8") as f:
+        f.writelines(new_lines)
 
 
-def _solve_arithmetic(norm: str, original: str) -> Optional[dict]:
-    expr = parse_expr(norm, transformations=_TRANSFORMS, evaluate=True)
-    if expr.free_symbols:
-        return None
-    val = sp.simplify(expr)
-    return {"kind": "arith", "expression": original.strip(),
-            "solution": f"= {_fmt(val)}"}
+# ----------------------------------------------------------------------
+# Math Parsing, Normalization & Cyrillic Variable Mapping
+# ----------------------------------------------------------------------
+TRANSFORMATIONS = standard_transformations + (implicit_multiplication_application,)
+
+CYRILLIC_TO_LATIN = {
+    'а': 'a', 'в': 'b', 'с': 'c', 'е': 'e', 'і': 'i',
+    'к': 'k', 'м': 'm', 'н': 'n', 'о': 'o', 'р': 'p',
+    'т': 't', 'х': 'x', 'у': 'y',
+    'А': 'A', 'В': 'B', 'С': 'C', 'Е': 'E', 'І': 'I',
+    'К': 'K', 'М': 'M', 'Н': 'N', 'О': 'O', 'Р': 'P',
+    'Т': 'T', 'Х': 'X', 'У': 'Y',
+}
 
 
-def _solve_equation(norm: str, original: str) -> Optional[dict]:
-    lhs, rhs = norm.split("=", 1)
-    if not lhs or not rhs:
-        return None
-    expr = parse_expr(f"({lhs}) - ({rhs})", transformations=_TRANSFORMS)
-    syms = sorted(expr.free_symbols, key=lambda s: s.name)
-    if not syms:
-        if sp.simplify(expr) == 0:
-            return {"kind": "identity", "expression": original.strip(),
-                    "solution": "тотожність"}
-        return None
-    x = syms[0]
-    sols = sp.solve(expr, x)
-    if not sols:
-        return None
-    sol_str = ", ".join(f"{x} = {_fmt(s)}" for s in sols)
-    return {"kind": "equation", "expression": original.strip(),
-            "solution": sol_str}
+def normalize_math_symbols(raw_text: str) -> str:
+    text = raw_text.strip()
+    for cyr, lat in CYRILLIC_TO_LATIN.items():
+        text = text.replace(cyr, lat)
 
-
-def extract_candidates(line: str) -> List[str]:
-    line = line.strip()
-    if not line:
-        return []
-    cands: List[str] = []
-    for m in _EQ_RE.finditer(line):
-        cands.append(m.group(0).strip())
-    for m in _ARITH_RE.finditer(line):
-        cands.append(m.group(0).strip())
-    if not cands:
-        cands.append(line)
-    seen, out = set(), []
-    for c in sorted(cands, key=len, reverse=True):
-        if c not in seen:
-            seen.add(c)
-            out.append(c)
-    return out
-
-
-def solve_line(line: str) -> Optional[dict]:
-    for cand in extract_candidates(line):
-        res = try_solve(cand)
-        if res:
-            return res
-    return None
-
-
-# ============================================================== AI
-_AI_PROMPT = (
-    "Ти - стислий математичний репетитор.\n"
-    "Поясни розв'язок виразу: \"{expression}\".\n"
-    "Формат відповіді:\n"
-    "1. Короткий результат.\n"
-    "2. 2-3 кроки пояснення без вітань і зайвих слів.\n"
-    "Мова: українська."
-)
-_ai_client = None
-
-
-def _get_ai_client():
-    global _ai_client
-    if _ai_client is None:
-        if not GEMINI_API_KEY:
-            raise RuntimeError("GEMINI_API_KEY не задано у .env")
-        from google import genai
-        _ai_client = genai.Client(api_key=GEMINI_API_KEY)
-    return _ai_client
-
-
-def explain(expression: str) -> str:
-    client = _get_ai_client()
-    resp = client.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=_AI_PROMPT.format(expression=expression),
-    )
-    text = getattr(resp, "text", None)
-    if not text:
-        raise RuntimeError("Порожня відповідь від Gemini")
+    text = text.replace("×", "*").replace("✕", "*").replace("·", "*").replace("•", "*")
+    text = text.replace("÷", "/").replace(":", "/")
+    text = text.replace("—", "-").replace("–", "-").replace("−", "-")
+    text = text.replace("²", "^2").replace("³", "^3").replace("√", "sqrt")
+    text = re.sub(r"(?<=\d)[Oo](?=\d)", "0", text)
+    text = re.sub(r"\s+", " ", text)
     return text.strip()
 
 
-# ============================================================== СТИЛІ
-STYLE_PANEL_BG   = "#000000"
-STYLE_TEXT       = "#ffffff"
-STYLE_TEXT_DIM   = "#888888"
-STYLE_BORDER     = "#333333"
-STYLE_BORDER_HI  = "#ffffff"
+def solve_locally(expr_str: str) -> dict:
+    """
+    Solves arithmetic and algebraic equations locally using SymPy.
+    """
+    cleaned = normalize_math_symbols(expr_str)
+    if cleaned.endswith("="):
+        cleaned = cleaned[:-1].strip()
+    cleaned = cleaned.replace("^", "**")
 
-PANEL_QSS = """
-QWidget#ControlPanel {
-    background: #000000;
-    color: #ffffff;
-}
-QLabel {
-    color: #ffffff;
-    font-size: 12px;
-}
-QLabel#TitleLabel {
-    color: #ffffff;
-    font-size: 16px;
-    font-weight: bold;
-    letter-spacing: 2px;
-}
-QLabel#StatusLabel {
-    color: #ffffff;
-    font-size: 11px;
-    padding: 4px 6px;
-    border: 1px solid #333333;
-}
-QLabel#HintLabel {
-    color: #888888;
-    font-size: 10px;
-}
-QPushButton {
-    background: #000000;
-    color: #ffffff;
-    border: 1px solid #ffffff;
-    padding: 6px 12px;
-    font-size: 12px;
-    border-radius: 0px;
-}
-QPushButton:hover {
-    background: #ffffff;
-    color: #000000;
-}
-QPushButton:pressed {
-    background: #cccccc;
-}
-QPushButton:disabled {
-    color: #555555;
-    border-color: #333333;
-}
-QPushButton#PrimaryButton {
-    background: #ffffff;
-    color: #000000;
-    border: 1px solid #ffffff;
-    padding: 10px 16px;
-    font-size: 13px;
-    font-weight: bold;
-    letter-spacing: 1px;
-}
-QPushButton#PrimaryButton:hover {
-    background: #000000;
-    color: #ffffff;
-}
-QCheckBox {
-    color: #ffffff;
-    font-size: 12px;
-    spacing: 8px;
-}
-QCheckBox::indicator {
-    width: 14px;
-    height: 14px;
-    border: 1px solid #ffffff;
-    background: #000000;
-}
-QCheckBox::indicator:checked {
-    background: #ffffff;
-}
-QSlider::groove:horizontal {
-    height: 2px;
-    background: #333333;
-}
-QSlider::handle:horizontal {
-    background: #ffffff;
-    width: 12px;
-    margin: -6px 0;
-    border-radius: 0px;
-}
-QLineEdit {
-    background: #000000;
-    color: #ffffff;
-    border: 1px solid #333333;
-    padding: 4px 6px;
-    font-size: 11px;
-}
-QTextBrowser {
-    background: #0a0a0a;
-    color: #ffffff;
-    border: 1px solid #333333;
-    font-size: 12px;
-}
-QDialog {
-    background: #000000;
-}
-"""
+    if not cleaned or re.search(r"[^\w\s\+\-\*\/\(\)\^\.\=\,\>\<]", cleaned):
+        return {"is_solved": False, "result_str": "Needs AI"}
+
+    try:
+        if "=" in cleaned:
+            parts = cleaned.split("=")
+            if len(parts) == 2:
+                lhs_str, rhs_str = parts[0].strip(), parts[1].strip()
+                if not lhs_str or not rhs_str:
+                    return {"is_solved": False, "result_str": "Needs AI"}
+
+                lhs = parse_expr(lhs_str, transformations=TRANSFORMATIONS)
+                rhs = parse_expr(rhs_str, transformations=TRANSFORMATIONS)
+                eq = sympy.Eq(lhs, rhs)
+                syms = sorted(list(eq.free_symbols), key=lambda s: s.name)
+
+                if syms:
+                    sols = sympy.solve(eq, syms)
+                    if isinstance(sols, list):
+                        sol_strs = []
+                        for s in sols:
+                            if isinstance(s, tuple):
+                                sol_strs.append(", ".join(str(item) for item in s))
+                            else:
+                                sol_strs.append(f"{syms[0].name} = {s}")
+                        res = ", ".join(sol_strs)
+                        return {"is_solved": True, "result_str": res}
+                    else:
+                        return {"is_solved": True, "result_str": str(sols)}
+                else:
+                    return {"is_solved": True, "result_str": "True" if bool(lhs == rhs) else "False"}
+        else:
+            parsed = parse_expr(cleaned, transformations=TRANSFORMATIONS)
+            if not parsed.free_symbols:
+                val = parsed.evalf()
+                if abs(val - round(float(val))) < 1e-9:
+                    return {"is_solved": True, "result_str": f"= {int(round(float(val)))}"}
+                return {"is_solved": True, "result_str": f"≈ {float(val):.4g}"}
+            else:
+                simplified = sympy.simplify(parsed)
+                return {"is_solved": True, "result_str": f"= {simplified}"}
+    except Exception:
+        return {"is_solved": False, "result_str": "Needs AI"}
+
+    return {"is_solved": False, "result_str": "Needs AI"}
 
 
-# ============================================================== CAPTURE FRAME
-class CaptureFrame(QWidget):
-    """Тільки рамка захвату. Тягнеться за будь-яке місце, ресайзиться з країв."""
-    roi_changed = pyqtSignal(QRect)
+def get_complexity_level(expr: str) -> tuple[str, str]:
+    """Determines math problem complexity for adaptive Gemini prompting."""
+    e = expr.lower()
+    if re.search(r"(sin|cos|tan|cot|log|ln|sqrt|\^3|\^[4-9])", e):
+        return "Advanced", "Advanced difficulty: Provide a clear, thorough step-by-step mathematical proof/derivation."
+    elif re.search(r"(\^2|\*\*2)", e) or ("/" in e and any(c.isalpha() for c in e)):
+        return "Medium", "Medium algebra: Provide a structured 2-3 step algebraic solution showing the core steps."
+    else:
+        return "Elementary", "Elementary school level: Provide an ultra-short, simple 1-2 sentence solution (e.g. explain the inverse operation) suitable for elementary school without intro chatter."
 
-    MARGIN = 14
-    MIN_W = 80
-    MIN_H = 60
 
-    def __init__(self):
-        super().__init__(None,
-            Qt.WindowType.FramelessWindowHint
-            | Qt.WindowType.WindowStaysOnTopHint
-            | Qt.WindowType.Tool)
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-        self.setMouseTracking(True)
-        self.setMinimumSize(self.MIN_W, self.MIN_H)
-        self.resize(DEFAULT_FRAME[2], DEFAULT_FRAME[3])
-        self.move(DEFAULT_FRAME[0], DEFAULT_FRAME[1])
-
-        self._drag_offset: Optional[QPoint] = None
-        self._resize_edge: Optional[str] = None
-        self._start_geom = QRect()
-        self._start_pos = QPoint()
-
-    def paintEvent(self, _):
-        p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        r = self.rect()
-        # Напівпрозора чорна підкладка (щоб рамка читалась на будь-якому фоні)
-        p.fillRect(r, QColor(0, 0, 0, 30))
-        # Пунктирна біла рамка
-        pen = QPen(QColor(255, 255, 255), 1, Qt.PenStyle.DashLine)
-        p.setPen(pen)
-        p.setBrush(Qt.BrushStyle.NoBrush)
-        p.drawRect(r.adjusted(1, 1, -2, -2))
-        # Кутові квадрати (видимі "ручки")
-        p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QColor(255, 255, 255))
-        s = 8
-        w, h = self.width(), self.height()
-        for cx, cy in [(0, 0), (w - s, 0), (0, h - s), (w - s, h - s)]:
-            p.drawRect(cx, cy, s, s)
-
-    def roi_rect(self) -> QRect:
-        return QRect(self.x(), self.y(), self.width(), self.height())
-
-    # ---------------------------------------------------- edge detection
-    def _edge_at(self, pos: QPoint) -> Optional[str]:
-        m = self.MARGIN
-        w, h = self.width(), self.height()
-        x, y = pos.x(), pos.y()
-        left, right = x < m, x > w - m
-        top, bottom = y < m, y > h - m
-        if top and left: return "tl"
-        if top and right: return "tr"
-        if bottom and left: return "bl"
-        if bottom and right: return "br"
-        if left: return "l"
-        if right: return "r"
-        if top: return "t"
-        if bottom: return "b"
-        return None
-
-    def _update_cursor(self, pos: QPoint):
-        e = self._edge_at(pos)
-        cursors = {
-            "tl": Qt.CursorShape.SizeFDiagCursor,
-            "br": Qt.CursorShape.SizeFDiagCursor,
-            "tr": Qt.CursorShape.SizeBDiagCursor,
-            "bl": Qt.CursorShape.SizeBDiagCursor,
-            "l":  Qt.CursorShape.SizeHorCursor,
-            "r":  Qt.CursorShape.SizeHorCursor,
-            "t":  Qt.CursorShape.SizeVerCursor,
-            "b":  Qt.CursorShape.SizeVerCursor,
+# ----------------------------------------------------------------------
+# Screen Capture & Strict Math Token Filtering
+# ----------------------------------------------------------------------
+def capture_screen_roi(x: int, y: int, width: int, height: int, dpr: float = 1.0) -> Image.Image:
+    with mss.mss() as sct:
+        monitor = {
+            "top": int(y * dpr),
+            "left": int(x * dpr),
+            "width": max(10, int(width * dpr)),
+            "height": max(10, int(height * dpr)),
         }
-        self.setCursor(cursors.get(e, Qt.CursorShape.SizeAllCursor))
-
-    def mousePressEvent(self, e):
-        if e.button() != Qt.MouseButton.LeftButton:
-            return
-        pos = e.position().toPoint()
-        self._resize_edge = self._edge_at(pos)
-        if self._resize_edge:
-            self._start_geom = QRect(self.geometry())
-            self._start_pos = e.globalPosition().toPoint()
-        else:
-            self._drag_offset = (e.globalPosition().toPoint()
-                                 - self.frameGeometry().topLeft())
-
-    def mouseMoveEvent(self, e):
-        buttons = e.buttons() & Qt.MouseButton.LeftButton
-        if self._resize_edge and buttons:
-            self._do_resize(e.globalPosition().toPoint())
-        elif self._drag_offset is not None and buttons:
-            self.move(e.globalPosition().toPoint() - self._drag_offset)
-        else:
-            self._update_cursor(e.position().toPoint())
-
-    def mouseReleaseEvent(self, e):
-        self._resize_edge = None
-        self._drag_offset = None
-
-    def _do_resize(self, gp: QPoint):
-        d = gp - self._start_pos
-        g = QRect(self._start_geom)
-        edge = self._resize_edge
-        if "l" in edge: g.setLeft(g.left() + d.x())
-        if "r" in edge: g.setRight(g.right() + d.x())
-        if "t" in edge: g.setTop(g.top() + d.y())
-        if "b" in edge: g.setBottom(g.bottom() + d.y())
-        if g.width() < self.MIN_W:
-            if "l" in edge: g.setLeft(g.right() - self.MIN_W)
-            else: g.setRight(g.left() + self.MIN_W)
-        if g.height() < self.MIN_H:
-            if "t" in edge: g.setTop(g.bottom() - self.MIN_H)
-            else: g.setBottom(g.top() + self.MIN_H)
-        self.setGeometry(g)
-
-    def moveEvent(self, e):
-        super().moveEvent(e)
-        self.roi_changed.emit(self.roi_rect())
-
-    def resizeEvent(self, e):
-        super().resizeEvent(e)
-        self.roi_changed.emit(self.roi_rect())
+        sct_img = sct.grab(monitor)
+        return Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
 
 
-# ============================================================== CONTROL PANEL
-class ControlPanel(QWidget):
-    """Окреме вікно з налаштуваннями."""
-    scan_requested = pyqtSignal()
-    auto_changed = pyqtSignal(bool, int)
-    hotkey_changed = pyqtSignal(str)
-    quit_requested = pyqtSignal()
-    tesseract_changed = pyqtSignal(str)
+def is_math_token(token: str) -> bool:
+    """Rejects general text words, task labels (e.g. 336.), and accepts math symbols."""
+    t = token.strip()
+    if not t:
+        return False
+
+    # Ignore Cyrillic or Latin words with length >= 2 (like 'Розв\'яжи', 'рівняння', 'solve')
+    if re.search(r"[a-zA-Zа-яіїєґА-ЯІЇЄҐ]{2,}", t):
+        # Allow known math functions
+        if t.lower() in ("sqrt", "sin", "cos", "tan", "log", "ln"):
+            return True
+        return False
+
+    # Ignore numbered list markers like '336.', '1)', '2.'
+    if re.match(r"^\d+[\.\)]$", t):
+        return False
+
+    # Accept numbers, operators, single-character variables
+    if re.search(r"[\d\+\-\*\/\:\·\•\×\=\^\(\)]", t):
+        return True
+    if re.match(r"^[a-zA-Zа-яіїєґ]$", t):
+        return True
+
+    return False
+
+
+def is_valid_math_expression(expr_str: str) -> bool:
+    """Verifies that an assembled token group represents a real math problem."""
+    # Must have at least one digit or two distinct variables
+    has_digit = bool(re.search(r"\d", expr_str))
+    has_operator = bool(re.search(r"[\+\-\*\/\:\·\•\×\=\^]", expr_str))
+    if not has_operator:
+        return False
+    if not has_digit:
+        vars_found = set(re.findall(r"[a-zA-Zа-яіїєґ]", expr_str))
+        if len(vars_found) < 2:
+            return False
+    return True
+
+
+def extract_math_blocks(image: Image.Image, min_conf: int = 15) -> list[dict]:
+    tess = TESSERACT_CMD if (TESSERACT_CMD and os.path.isfile(TESSERACT_CMD)) else find_tesseract_cmd()
+    if not tess:
+        raise pytesseract.TesseractNotFoundError()
+
+    pytesseract.pytesseract.tesseract_cmd = tess
+    custom_cfg = r"--oem 3 --psm 6"
+
+    try:
+        data = pytesseract.image_to_data(
+            image, lang=OCR_LANG, config=custom_cfg, output_type=pytesseract.Output.DICT
+        )
+    except pytesseract.TesseractNotFoundError:
+        raise
+    except Exception as e:
+        if "tesseract is not installed" in str(e).lower():
+            raise pytesseract.TesseractNotFoundError()
+        raise e
+
+    n_boxes = len(data["text"])
+    lines_dict = {}
+
+    for i in range(n_boxes):
+        raw_word = data["text"][i].strip()
+        conf = int(data["conf"][i]) if str(data["conf"][i]).isdigit() else -1
+        if not raw_word or conf < min_conf:
+            continue
+
+        if not is_math_token(raw_word):
+            continue
+
+        key = (data["block_num"][i], data["par_num"][i], data["line_num"][i])
+        tok = {
+            "text": raw_word,
+            "l": data["left"][i],
+            "t": data["top"][i],
+            "r": data["left"][i] + data["width"][i],
+            "b": data["top"][i] + data["height"][i],
+            "conf": conf,
+        }
+        if key not in lines_dict:
+            lines_dict[key] = []
+        lines_dict[key].append(tok)
+
+    results = []
+
+    # Process each line, splitting multiple equations separated by columns/large gaps
+    for _, tokens in lines_dict.items():
+        if not tokens:
+            continue
+
+        # Sort tokens horizontally
+        tokens.sort(key=lambda item: item["l"])
+
+        groups = []
+        cur_group = []
+
+        for tok in tokens:
+            if not cur_group:
+                cur_group.append(tok)
+                continue
+
+            prev = cur_group[-1]
+            gap = tok["l"] - prev["r"]
+            avg_h = max(12, prev["b"] - prev["t"])
+            has_equals = any(t["text"] == "=" for t in cur_group)
+
+            # Split if there is a column gap (> 25px or 1.4x line height) or a second '=' sign
+            if gap > max(24, avg_h * 1.4) or (has_equals and tok["text"] == "="):
+                groups.append(cur_group)
+                cur_group = [tok]
+            else:
+                cur_group.append(tok)
+
+        if cur_group:
+            groups.append(cur_group)
+
+        for g in groups:
+            expr_str = " ".join(t["text"] for t in g)
+            if is_valid_math_expression(expr_str):
+                min_l = min(t["l"] for t in g)
+                min_t = min(t["t"] for t in g)
+                max_r = max(t["r"] for t in g)
+                max_b = max(t["b"] for t in g)
+
+                results.append({
+                    "text": expr_str,
+                    "x": min_l,
+                    "y": min_t,
+                    "w": max_r - min_l,
+                    "h": max_b - min_t,
+                })
+
+    return results
+
+
+# ----------------------------------------------------------------------
+# Adaptive Gemini AI Explainer
+# ----------------------------------------------------------------------
+_gemini_client = None
+_gemini_type = None
+
+
+def get_gemini_client():
+    global _gemini_client, _gemini_type
+    if _gemini_client is not None:
+        return _gemini_client, _gemini_type
+
+    api_key = os.getenv("GEMINI_API_KEY", "").strip() or GEMINI_API_KEY
+    if not api_key:
+        raise ValueError("GEMINI_API_KEY is not configured.")
+
+    try:
+        from google import genai
+        _gemini_client = genai.Client(api_key=api_key)
+        _gemini_type = "google-genai"
+        return _gemini_client, _gemini_type
+    except ImportError:
+        pass
+
+    try:
+        import google.generativeai as genai
+        genai.configure(api_key=api_key)
+        _gemini_client = genai
+        _gemini_type = "google-generativeai"
+        return _gemini_client, _gemini_type
+    except ImportError:
+        pass
+
+    raise ImportError("Please install google-genai or google-generativeai.")
+
+
+def ask_gemini_explanation(expression: str) -> tuple[str, str]:
+    """
+    Returns (complexity_level, explanation_text) adapting depth to math level.
+    """
+    level_name, level_instruction = get_complexity_level(expression)
+
+    try:
+        client, ctype = get_gemini_client()
+    except Exception as e:
+        return level_name, f"AI Setup Error: {str(e)}"
+
+    prompt = (
+        f"You are a math tutor. Explain the solution for: \"{expression}\".\n"
+        f"Level context: {level_instruction}\n"
+        "Format:\n"
+        "1. Final answer.\n"
+        "2. Step-by-step solution matching the requested depth.\n"
+        "Language: Ukrainian (or English if formula only)."
+    )
+
+    if ctype == "google-genai":
+        try:
+            resp = client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
+            return level_name, resp.text.strip() if resp.text else "No explanation."
+        except Exception:
+            try:
+                resp = client.models.generate_content(model=GEMINI_FALLBACK_MODEL, contents=prompt)
+                return level_name, resp.text.strip() if resp.text else "No explanation."
+            except Exception as err:
+                return level_name, f"Gemini Error: {str(err)}"
+    elif ctype == "google-generativeai":
+        try:
+            model = client.GenerativeModel(GEMINI_FALLBACK_MODEL)
+            resp = model.generate_content(prompt)
+            return level_name, resp.text.strip() if resp.text else "No explanation."
+        except Exception as err:
+            return level_name, f"Gemini Error: {str(err)}"
+
+    return level_name, "Unknown client error."
+
+
+# ----------------------------------------------------------------------
+# GUI: Window 1 (Pure Transparent Capture ROI Frame)
+# ----------------------------------------------------------------------
+class CaptureFrame(QWidget):
+    region_changed = pyqtSignal(QRect)
+    close_clicked = pyqtSignal()
 
     def __init__(self):
-        super().__init__(None)
-        self.setObjectName("ControlPanel")
-        self.setWindowTitle("MathLens")
-        self.setFixedWidth(420)
-        self.setStyleSheet(PANEL_QSS)
-
-        self._hotkey = DEFAULT_HOTKEY
-        self._build_ui()
-        self._refresh_tesseract_status()
-
-    def _build_ui(self):
-        root = QVBoxLayout(self)
-        root.setContentsMargins(16, 16, 16, 16)
-        root.setSpacing(12)
-
-        # Заголовок
-        title = QLabel("MATHLENS")
-        title.setObjectName("TitleLabel")
-        root.addWidget(title)
-
-        sub = QLabel("Screen OCR + SymPy + optional Gemini")
-        sub.setObjectName("HintLabel")
-        root.addWidget(sub)
-
-        root.addWidget(self._hsep())
-
-        # Tesseract
-        row_t = QHBoxLayout()
-        self.tess_status = QLabel("Tesseract: -")
-        self.tess_status.setObjectName("StatusLabel")
-        row_t.addWidget(self.tess_status, 1)
-        btn_browse = QPushButton("Browse")
-        btn_browse.clicked.connect(self._on_browse_tesseract)
-        row_t.addWidget(btn_browse)
-        root.addLayout(row_t)
-
-        # Hotkey
-        row_h = QHBoxLayout()
-        self.hotkey_btn = QPushButton(f"Hotkey: {self._hotkey}")
-        self.hotkey_btn.clicked.connect(self._on_hotkey_clicked)
-        row_h.addWidget(self.hotkey_btn, 1)
-        root.addLayout(row_h)
-
-        root.addWidget(self._hsep())
-
-        # Auto
-        row_a = QHBoxLayout()
-        self.auto_chk = QCheckBox("Auto scan")
-        self.auto_chk.stateChanged.connect(self._emit_auto)
-        row_a.addWidget(self.auto_chk)
-
-        self.interval_slider = QSlider(Qt.Orientation.Horizontal)
-        self.interval_slider.setRange(1, 10)
-        self.interval_slider.setValue(DEFAULT_INTERVAL_S)
-        self.interval_slider.valueChanged.connect(self._emit_auto)
-        row_a.addWidget(self.interval_slider, 1)
-
-        self.interval_lbl = QLabel(f"{DEFAULT_INTERVAL_S}s")
-        self.interval_lbl.setFixedWidth(30)
-        row_a.addWidget(self.interval_lbl)
-        root.addLayout(row_a)
-
-        root.addWidget(self._hsep())
-
-        # Scan button
-        self.scan_btn = QPushButton("ANALYZE")
-        self.scan_btn.setObjectName("PrimaryButton")
-        self.scan_btn.clicked.connect(self.scan_requested.emit)
-        root.addWidget(self.scan_btn)
-
-        # Status
-        self.status_lbl = QLabel("Ready")
-        self.status_lbl.setObjectName("StatusLabel")
-        root.addWidget(self.status_lbl)
-
-        # Quit
-        btn_quit = QPushButton("Quit")
-        btn_quit.clicked.connect(self.quit_requested.emit)
-        root.addWidget(btn_quit)
-
-        hint = QLabel("Hotkey scans current frame. Drag the white frame to position. "
-                      "Resize from any edge.")
-        hint.setObjectName("HintLabel")
-        hint.setWordWrap(True)
-        root.addWidget(hint)
-
-    @staticmethod
-    def _hsep() -> QFrame:
-        f = QFrame()
-        f.setFrameShape(QFrame.Shape.HLine)
-        f.setStyleSheet("color:#333333; background:#333333; max-height:1px;")
-        return f
-
-    # --------------------------------------------------------- status
-    def set_status(self, text: str):
-        self.status_lbl.setText(text)
-
-    def _refresh_tesseract_status(self):
-        if _TESS_PATH and os.path.isfile(_TESS_PATH):
-            self.tess_status.setText(f"Tesseract: OK")
-            self.tess_status.setToolTip(_TESS_PATH)
-        else:
-            self.tess_status.setText("Tesseract: NOT FOUND")
-            self.tess_status.setToolTip(
-                "Install Tesseract or click Browse to point to tesseract.exe")
-
-    def _on_browse_tesseract(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Select tesseract executable", "",
-            "Tesseract (tesseract.exe tesseract);;All files (*)")
-        if path:
-            set_tesseract_path(path)
-            self._refresh_tesseract_status()
-            self.tesseract_changed.emit(path)
-
-    # --------------------------------------------------------- hotkey
-    def _on_hotkey_clicked(self):
-        text, ok = QInputDialog.getText(
-            self, "Hotkey", "Combination (F8, ctrl+alt+m, ...):",
-            text=self._hotkey)
-        if ok and text.strip():
-            self._hotkey = text.strip()
-            self.hotkey_btn.setText(f"Hotkey: {self._hotkey}")
-            self.hotkey_changed.emit(self._hotkey)
-
-    # --------------------------------------------------------- auto
-    def _emit_auto(self, *_):
-        self.interval_lbl.setText(f"{self.interval_slider.value()}s")
-        self.auto_changed.emit(self.auto_chk.isChecked(),
-                               self.interval_slider.value())
-
-
-# ============================================================== UI: BADGE
-class BadgeWindow(QWidget):
-    clicked = pyqtSignal(dict)
-
-    def __init__(self, data: dict, label: str, is_solved: bool):
-        super().__init__(None,
+        super().__init__()
+        self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint
             | Qt.WindowType.WindowStaysOnTopHint
             | Qt.WindowType.Tool
-            | Qt.WindowType.WindowDoesNotAcceptFocus)
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
-        self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.data = data
-        self._label = label
-        self._is_solved = is_solved
-        f = QFont(); f.setPointSize(9); f.setBold(True)
-        self.setFont(f)
-        fm = self.fontMetrics()
-        self.resize(fm.horizontalAdvance(label) + 20, fm.height() + 10)
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.resize(600, 320)
+        self.move(180, 180)
 
-    def paintEvent(self, _):
-        p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        r = self.rect().adjusted(0, 0, -1, -1)
-        if self._is_solved:
-            bg, fg, border = QColor(0, 0, 0, 235), QColor(255, 255, 255), QColor(255, 255, 255)
-        else:
-            bg, fg, border = QColor(255, 255, 255, 240), QColor(0, 0, 0), QColor(255, 255, 255)
-        p.setBrush(bg)
-        p.setPen(QPen(border, 1))
-        p.drawRoundedRect(r, 4, 4)
-        p.setPen(fg)
-        p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, self._label)
+        self.border_width = 4
+        self.resizing = False
+        self.moving = False
+        self.drag_position = QPoint()
+        self.active_edge = None
 
-    def mousePressEvent(self, e):
-        if e.button() == Qt.MouseButton.LeftButton:
-            self.clicked.emit(self.data)
+        top_bar = QWidget(self)
+        top_bar.setFixedHeight(24)
+        top_layout = QHBoxLayout(top_bar)
+        top_layout.setContentsMargins(8, 2, 8, 2)
+
+        lbl_drag = QLabel("⠿ ROI FRAME (drag here to move)", top_bar)
+        lbl_drag.setStyleSheet("color: #000000; font-size: 11px; font-weight: bold;")
+        lbl_drag.setCursor(QCursor(Qt.CursorShape.SizeAllCursor))
+        top_layout.addWidget(lbl_drag)
+        top_layout.addStretch()
+
+        btn_close = QPushButton("✕", top_bar)
+        btn_close.setFixedSize(20, 18)
+        btn_close.setStyleSheet("""
+            QPushButton {
+                background: #000000;
+                color: #ffffff;
+                border: 1px solid #ffffff;
+                border-radius: 2px;
+                font-weight: bold;
+                font-size: 10px;
+                padding: 0;
+            }
+            QPushButton:hover {
+                background: #d32f2f;
+                border: 1px solid #d32f2f;
+            }
+        """)
+        btn_close.clicked.connect(self.close_clicked.emit)
+        top_layout.addWidget(btn_close)
+
+        self.top_bar = top_bar
+        self.setMouseTracking(True)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.top_bar.setGeometry(
+            self.border_width,
+            self.border_width,
+            self.width() - 2 * self.border_width,
+            24,
+        )
+        self.region_changed.emit(self.get_capture_rect())
+
+    def get_capture_rect(self) -> QRect:
+        bar_h = self.top_bar.height()
+        tl = self.mapToGlobal(QPoint(self.border_width, self.border_width + bar_h))
+        w = max(10, self.width() - 2 * self.border_width)
+        h = max(10, self.height() - 2 * self.border_width - bar_h)
+        return QRect(tl.x(), tl.y(), w, h)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        # Header bar (solid white strip)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QBrush(QColor("#ffffff")))
+        painter.drawRect(
+            self.border_width,
+            self.border_width,
+            self.width() - 2 * self.border_width,
+            self.top_bar.height(),
+        )
+
+        # Subtle dark scrim
+        painter.setBrush(QBrush(QColor(0, 0, 0, 15)))
+        pen = QPen(QColor("#ffffff"), self.border_width)
+        painter.setPen(pen)
+        painter.drawRect(
+            self.border_width // 2,
+            self.border_width // 2,
+            self.width() - self.border_width,
+            self.height() - self.border_width,
+        )
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            edge = self._detect_edge(event.pos())
+            if edge:
+                self.resizing = True
+                self.active_edge = edge
+            else:
+                self.moving = True
+                self.drag_position = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+            event.accept()
+
+    def mouseMoveEvent(self, event):
+        pos = event.pos()
+        if not self.resizing and not self.moving:
+            edge = self._detect_edge(pos)
+            self._update_cursor(edge)
+        elif self.moving:
+            self.move(event.globalPosition().toPoint() - self.drag_position)
+            self.region_changed.emit(self.get_capture_rect())
+        elif self.resizing:
+            self._resize_by_edge(event.globalPosition().toPoint())
+            self.region_changed.emit(self.get_capture_rect())
+
+    def mouseReleaseEvent(self, event):
+        self.resizing = False
+        self.moving = False
+        self.active_edge = None
+        self.setCursor(QCursor(Qt.CursorShape.ArrowCursor))
+        self.region_changed.emit(self.get_capture_rect())
+
+    def moveEvent(self, event):
+        super().moveEvent(event)
+        self.region_changed.emit(self.get_capture_rect())
+
+    def _detect_edge(self, pos: QPoint):
+        b = self.border_width + 6
+        w, h = self.width(), self.height()
+        left, right, top, bottom = pos.x() < b, pos.x() > w - b, pos.y() < b, pos.y() > h - b
+        if top and left: return "top_left"
+        if top and right: return "top_right"
+        if bottom and left: return "bottom_left"
+        if bottom and right: return "bottom_right"
+        if left: return "left"
+        if right: return "right"
+        if top: return "top"
+        if bottom: return "bottom"
+        return None
+
+    def _update_cursor(self, edge):
+        cmap = {
+            "top_left": Qt.CursorShape.SizeFDiagCursor, "bottom_right": Qt.CursorShape.SizeFDiagCursor,
+            "top_right": Qt.CursorShape.SizeBDiagCursor, "bottom_left": Qt.CursorShape.SizeBDiagCursor,
+            "left": Qt.CursorShape.SizeHorCursor, "right": Qt.CursorShape.SizeHorCursor,
+            "top": Qt.CursorShape.SizeVerCursor, "bottom": Qt.CursorShape.SizeVerCursor,
+        }
+        self.setCursor(QCursor(cmap.get(edge, Qt.CursorShape.ArrowCursor)))
+
+    def _resize_by_edge(self, global_pt: QPoint):
+        geo = self.geometry()
+        min_w, min_h = 180, 120
+        if "right" in self.active_edge: geo.setRight(max(global_pt.x(), geo.left() + min_w))
+        if "bottom" in self.active_edge: geo.setBottom(max(global_pt.y(), geo.top() + min_h))
+        if "left" in self.active_edge: geo.setLeft(min(global_pt.x(), geo.right() - min_w))
+        if "top" in self.active_edge: geo.setTop(min(global_pt.y(), geo.bottom() - min_h))
+        self.setGeometry(geo)
 
 
-class OverlayManager:
-    def __init__(self, on_click):
-        self._badges: List[BadgeWindow] = []
-        self._roi = QRect()
-        self._on_click = on_click
+# ----------------------------------------------------------------------
+# GUI: Window 2 (Control Panel with Windows Taskbar Presence)
+# ----------------------------------------------------------------------
+class ControlPanelWindow(QMainWindow):
+    scan_requested = pyqtSignal()
+    auto_scan_toggled = pyqtSignal(bool, int)
+    hotkey_changed = pyqtSignal(str)
+    toggle_frame_requested = pyqtSignal()
 
-    def clear(self):
-        for b in self._badges:
-            b.hide(); b.deleteLater()
-        self._badges.clear()
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("MathLens - Control Panel")
+        self.resize(440, 320)
+        self.setStyleSheet("""
+            QMainWindow, QWidget { background-color: #121212; color: #ffffff; font-family: 'Segoe UI', Arial; font-size: 12px; }
+            QFrame.card { background-color: #1c1c1c; border: 1px solid #333333; border-radius: 6px; }
+            QPushButton { background-color: #242424; color: #ffffff; border: 1px solid #555555; border-radius: 4px; padding: 6px 12px; font-weight: bold; }
+            QPushButton:hover { background-color: #333333; border: 1px solid #ffffff; }
+            QPushButton.primary { background-color: #ffffff; color: #000000; border: 1px solid #ffffff; }
+            QPushButton.primary:hover { background-color: #e0e0e0; }
+            QLineEdit { background-color: #181818; border: 1px solid #444444; color: #ffffff; padding: 5px 8px; border-radius: 3px; }
+            QLineEdit:focus { border: 1px solid #ffffff; }
+            QSlider::groove:horizontal { height: 4px; background: #333333; }
+            QSlider::handle:horizontal { background: #ffffff; width: 14px; margin: -5px 0; border-radius: 7px; }
+            QCheckBox::indicator { width: 16px; height: 16px; border: 1px solid #555555; background: #181818; }
+            QCheckBox::indicator:checked { background: #ffffff; }
+        """)
 
-    def set_roi(self, roi: QRect):
-        self._roi = QRect(roi)
-        for b in self._badges:
-            b.move(self._badge_pos(b.data))
+        central = QWidget()
+        self.setCentralWidget(central)
+        layout = QVBoxLayout(central)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(12)
 
-    def show_items(self, roi: QRect, items: List[dict]):
-        self.clear()
-        self._roi = QRect(roi)
-        for it in items:
-            label, solved = self._label_for(it)
-            b = BadgeWindow(it, label, solved)
-            b.clicked.connect(self._on_click)
-            b.move(self._badge_pos(it))
-            b.show()
-            self._badges.append(b)
+        card_act = QFrame()
+        card_act.setProperty("class", "card")
+        act_l = QHBoxLayout(card_act)
+        self.btn_scan = QPushButton(f"Analyze Now ({DEFAULT_HOTKEY})")
+        self.btn_scan.setProperty("class", "primary")
+        self.btn_scan.setFixedHeight(34)
+        self.btn_scan.clicked.connect(self.scan_requested.emit)
+        act_l.addWidget(self.btn_scan)
 
-    def _badge_pos(self, item: dict) -> QPoint:
-        x, y, _, h = item["rect"]
-        return QPoint(self._roi.x() + x, self._roi.y() + y + h + 4)
+        self.btn_toggle = QPushButton("Hide/Show Frame")
+        self.btn_toggle.setFixedHeight(34)
+        self.btn_toggle.clicked.connect(self.toggle_frame_requested.emit)
+        act_l.addWidget(self.btn_toggle)
+        layout.addWidget(card_act)
 
-    @staticmethod
-    def _label_for(item: dict) -> Tuple[str, bool]:
-        sol = item.get("solution")
-        if sol:
-            label = sol if len(sol) <= 30 else sol[:28] + "..."
-            return label, True
-        return "ASK AI", False
+        card_st = QFrame()
+        card_st.setProperty("class", "card")
+        st_l = QHBoxLayout(card_st)
+        st_l.addWidget(QLabel("Status:"))
+        self.lbl_status = QLabel("Ready")
+        self.lbl_status.setStyleSheet("font-weight: bold; color: #ffffff;")
+        st_l.addWidget(self.lbl_status)
+        st_l.addStretch()
+        layout.addWidget(card_st)
+
+        card_set = QFrame()
+        card_set.setProperty("class", "card")
+        set_l = QVBoxLayout(card_set)
+        set_l.setSpacing(10)
+
+        row1 = QHBoxLayout()
+        row1.addWidget(QLabel("Hotkey:"))
+        self.txt_hotkey = QLineEdit(DEFAULT_HOTKEY)
+        self.txt_hotkey.setFixedWidth(50)
+        self.txt_hotkey.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.txt_hotkey.editingFinished.connect(lambda: self.hotkey_changed.emit(self.txt_hotkey.text().strip().upper()))
+        row1.addWidget(self.txt_hotkey)
+
+        row1.addSpacing(20)
+        self.chk_auto = QCheckBox("Auto-Scan")
+        self.chk_auto.toggled.connect(lambda c: self.auto_scan_toggled.emit(c, self.slider.value()))
+        row1.addWidget(self.chk_auto)
+
+        self.slider = QSlider(Qt.Orientation.Horizontal)
+        self.slider.setRange(1, 10)
+        self.slider.setValue(DEFAULT_INTERVAL)
+        self.slider.setFixedWidth(80)
+        self.slider.valueChanged.connect(self._on_slider)
+        row1.addWidget(self.slider)
+
+        self.lbl_interval = QLabel(f"{DEFAULT_INTERVAL}s")
+        row1.addWidget(self.lbl_interval)
+        set_l.addLayout(row1)
+
+        row2 = QVBoxLayout()
+        row2.addWidget(QLabel("Tesseract Path (tesseract.exe):"))
+        p_box = QHBoxLayout()
+        self.txt_tess = QLineEdit(TESSERACT_CMD)
+        self.txt_tess.setPlaceholderText("Select tesseract.exe path...")
+        p_box.addWidget(self.txt_tess)
+
+        self.btn_browse = QPushButton("Browse...")
+        self.btn_browse.clicked.connect(self._browse_tess)
+        p_box.addWidget(self.btn_browse)
+        row2.addLayout(p_box)
+        set_l.addLayout(row2)
+
+        layout.addWidget(card_set)
+        layout.addStretch()
+
+        foot = QHBoxLayout()
+        btn_quit = QPushButton("Quit Application")
+        btn_quit.clicked.connect(QApplication.instance().quit)
+        foot.addStretch()
+        foot.addWidget(btn_quit)
+        layout.addLayout(foot)
+
+    def set_status(self, text: str, is_error: bool = False):
+        self.lbl_status.setText(text)
+        self.lbl_status.setStyleSheet(f"font-weight: bold; color: {'#ff5555' if is_error else '#ffffff'};")
+
+    def _on_slider(self, val: int):
+        self.lbl_interval.setText(f"{val}s")
+        if self.chk_auto.isChecked():
+            self.auto_scan_toggled.emit(True, val)
+
+    def _browse_tess(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Select tesseract.exe", "C:/", "Executables (*.exe);;All Files (*.*)")
+        if path:
+            self.txt_tess.setText(path)
+            save_tesseract_cmd(path)
+            self.set_status("Tesseract path updated!", False)
+
+    def closeEvent(self, event):
+        QApplication.instance().quit()
+        event.accept()
 
 
-# ============================================================== AI WORKER
-class AIWorker(QThread):
-    done = pyqtSignal(str)
-    err = pyqtSignal(str)
-
-    def __init__(self, expression: str, parent=None):
+# ----------------------------------------------------------------------
+# GUI: Visual Bounding Boxes & Dual Badges (Answer + AI Button)
+# ----------------------------------------------------------------------
+class ExplanationDialog(QDialog):
+    def __init__(self, expr: str, local_res: str, parent=None):
         super().__init__(parent)
-        self.expression = expression
+        self.setWindowTitle("Solution & AI Steps")
+        self.resize(520, 380)
+        self.setStyleSheet("""
+            QDialog { background-color: #121212; color: #ffffff; font-family: 'Segoe UI', Arial; }
+            QTextBrowser { background-color: #1c1c1c; color: #e0e0e0; border: 1px solid #333333; padding: 12px; font-size: 13px; border-radius: 4px; }
+            QPushButton { background-color: #ffffff; color: #000000; font-weight: bold; padding: 6px 16px; border-radius: 4px; border: none; }
+            QPushButton:hover { background-color: #cccccc; }
+        """)
 
-    def run(self):
-        try:
-            self.done.emit(explain(self.expression))
-        except Exception as e:
-            self.err.emit(str(e))
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(10)
 
+        header_box = QHBoxLayout()
+        lbl_expr = QLabel(f"Expression: {expr}")
+        lbl_expr.setStyleSheet("font-size: 14px; font-weight: bold;")
+        header_box.addWidget(lbl_expr)
+        header_box.addStretch()
 
-class DetailDialog(QDialog):
-    def __init__(self, item: dict, parent=None):
-        super().__init__(parent)
-        self.item = item
-        self._worker: Optional[AIWorker] = None
-        self.setWindowTitle("Details")
-        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
-        self.setStyleSheet(PANEL_QSS)
-        self.resize(560, 420)
+        self.lbl_diff = QLabel("Detecting...")
+        self.lbl_diff.setStyleSheet("color: #aaaaaa; font-size: 11px; border: 1px solid #444; border-radius: 3px; padding: 2px 6px;")
+        header_box.addWidget(self.lbl_diff)
+        layout.addLayout(header_box)
 
-        v = QVBoxLayout(self)
-        v.setContentsMargins(16, 16, 16, 16)
-        v.setSpacing(10)
-
-        t = QLabel("EXPRESSION")
-        t.setObjectName("TitleLabel")
-        v.addWidget(t)
-
-        lbl = QLabel(f"<code>{item['text']}</code>")
-        lbl.setTextFormat(Qt.TextFormat.RichText)
-        lbl.setWordWrap(True)
-        v.addWidget(lbl)
-
-        sol = item.get("solution")
-        s = QLabel(f"LOCAL RESULT: {sol}" if sol
-                   else "LOCAL RESULT: not solved")
-        s.setObjectName("StatusLabel")
-        v.addWidget(s)
+        if local_res and "Needs" not in local_res:
+            lbl_ans = QLabel(f"Local Solver Result: {local_res}")
+            lbl_ans.setStyleSheet("color: #81c784; font-weight: bold;")
+            layout.addWidget(lbl_ans)
 
         self.browser = QTextBrowser()
-        v.addWidget(self.browser, 1)
+        self.browser.setMarkdown("Analyzing problem with Gemini AI...")
+        layout.addWidget(self.browser)
 
-        h = QHBoxLayout()
-        self.ai_btn = QPushButton("Ask Gemini")
-        self.ai_btn.setEnabled(bool(GEMINI_API_KEY))
-        self.ai_btn.clicked.connect(self._request_ai)
-        close_btn = QPushButton("Close")
-        close_btn.clicked.connect(self.accept)
-        h.addWidget(self.ai_btn); h.addStretch(1); h.addWidget(close_btn)
-        v.addLayout(h)
+        foot = QHBoxLayout()
+        foot.addStretch()
+        btn_close = QPushButton("Close")
+        btn_close.clicked.connect(self.accept)
+        foot.addWidget(btn_close)
+        layout.addLayout(foot)
 
-        if not GEMINI_API_KEY:
-            self.browser.setMarkdown("> GEMINI_API_KEY is not set in .env")
-
-    def _request_ai(self):
-        self.ai_btn.setEnabled(False)
-        self.browser.setMarkdown("*Requesting Gemini...*")
-        self._worker = AIWorker(self.item["text"], parent=self)
-        self._worker.done.connect(self._on_done)
-        self._worker.err.connect(self._on_err)
-        self._worker.finished.connect(self._worker.deleteLater)
-        self._worker.start()
-
-    def _on_done(self, text: str):
-        self.browser.setMarkdown(text); self.ai_btn.setEnabled(True)
-
-    def _on_err(self, msg: str):
-        self.browser.setMarkdown(f"**AI error:** {msg}")
-        self.ai_btn.setEnabled(True)
+        # Fetch adaptive explanation
+        level_name, explanation = ask_gemini_explanation(expr)
+        self.lbl_diff.setText(f"Level: {level_name}")
+        self.browser.setMarkdown(explanation)
 
 
-# ============================================================== SCAN TASK
-class ScanSignals(QObject):
-    done = pyqtSignal(QRect, list)
-    error = pyqtSignal(str)
+class MathItemWidget(QWidget):
+    """
+    Renders the local answer badge and a separate [ ⚡ AI ] button right next to it.
+    """
+    def __init__(self, expr_text: str, result_info: dict, parent=None):
+        super().__init__(parent)
+        self.expr_text = expr_text
+        self.result_info = result_info
+        is_solved = result_info.get("is_solved", False)
+        res_str = result_info.get("result_str", "Needs AI")
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+
+        if is_solved:
+            # Answer badge
+            self.lbl_ans = QLabel(f"[ {res_str} ]")
+            self.lbl_ans.setStyleSheet("""
+                QLabel {
+                    background-color: #000000;
+                    color: #ffffff;
+                    font-family: 'Consolas', monospace;
+                    font-weight: bold;
+                    font-size: 12px;
+                    border: 1px solid #ffffff;
+                    border-radius: 3px;
+                    padding: 2px 6px;
+                }
+            """)
+            layout.addWidget(self.lbl_ans)
+
+            # Separate small AI button
+            self.btn_ai = QPushButton("⚡ AI")
+            self.btn_ai.setStyleSheet("""
+                QPushButton {
+                    background-color: #242424;
+                    color: #ffffff;
+                    font-size: 11px;
+                    font-weight: bold;
+                    border: 1px solid #666666;
+                    border-radius: 3px;
+                    padding: 2px 6px;
+                }
+                QPushButton:hover {
+                    background-color: #ffffff;
+                    color: #000000;
+                    border: 1px solid #ffffff;
+                }
+            """)
+            self.btn_ai.setCursor(Qt.CursorShape.PointingHandCursor)
+            self.btn_ai.clicked.connect(self._open_dialog)
+            layout.addWidget(self.btn_ai)
+        else:
+            # Fallback button for complex problems
+            self.btn_ai = QPushButton("⚡ Solve with AI")
+            self.btn_ai.setStyleSheet("""
+                QPushButton {
+                    background-color: #1a1a1a;
+                    color: #ffffff;
+                    font-size: 11px;
+                    font-weight: bold;
+                    border: 1px dashed #ffffff;
+                    border-radius: 3px;
+                    padding: 2px 8px;
+                }
+                QPushButton:hover {
+                    background-color: #ffffff;
+                    color: #000000;
+                }
+            """)
+            self.btn_ai.setCursor(Qt.CursorShape.PointingHandCursor)
+            self.btn_ai.clicked.connect(self._open_dialog)
+            layout.addWidget(self.btn_ai)
+
+    def _open_dialog(self):
+        dlg = ExplanationDialog(self.expr_text, self.result_info.get("result_str", ""), self.window())
+        dlg.exec()
 
 
-class ScanTask(QRunnable):
-    def __init__(self, roi: QRect):
+class HUDOverlay(QWidget):
+    """
+    Transparent HUD overlay that outlines math problems with bounding boxes
+    and positions Answer badges + AI buttons neatly around them.
+    """
+    def __init__(self):
         super().__init__()
-        self.roi = QRect(roi)
-        self.signals = ScanSignals()
+        self.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.Tool
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+
+        self.items_data = []
+        self.widgets = []
+        self.hide()
+
+    def sync_with_roi(self, rect: QRect):
+        self.setGeometry(rect)
+
+    def clear_results(self):
+        for w in self.widgets:
+            w.deleteLater()
+        self.widgets.clear()
+        self.items_data.clear()
+        self.update()
+
+    def display_results(self, items: list[dict], dpr: float = 1.0):
+        self.clear_results()
+        self.items_data = items
+
+        for item in items:
+            # Convert physical image pixels to Qt logical coordinates
+            lx = int(item["x"] / dpr)
+            ly = int(item["y"] / dpr)
+            lw = int(item["w"] / dpr)
+            lh = int(item["h"] / dpr)
+
+            item["lx"] = lx
+            item["ly"] = ly
+            item["lw"] = lw
+            item["lh"] = lh
+
+            widget = MathItemWidget(item["text"], item["solution"], self)
+            widget.adjustSize()
+
+            # Place widget above the bounding box if space allows, otherwise below
+            bw = widget.sizeHint().width()
+            bh = widget.sizeHint().height()
+
+            if ly - bh - 4 >= 0:
+                pos_x = min(self.width() - bw - 4, max(2, lx))
+                pos_y = ly - bh - 4
+            else:
+                pos_x = min(self.width() - bw - 4, max(2, lx))
+                pos_y = ly + lh + 4
+
+            widget.setGeometry(pos_x, pos_y, bw, bh)
+            widget.show()
+            self.widgets.append(widget)
+
+        self.show()
+        self.update()
+
+    def paintEvent(self, event):
+        """Draws crisp bounding box outlines around every detected math expression."""
+        if not self.items_data:
+            return
+
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        # High-contrast rounded rectangle outline around the problem
+        pen = QPen(QColor(255, 255, 255, 230), 1.5, Qt.PenStyle.SolidLine)
+        brush = QBrush(QColor(0, 0, 0, 30))
+        painter.setPen(pen)
+        painter.setBrush(brush)
+
+        for item in self.items_data:
+            lx = item.get("lx", 0)
+            ly = item.get("ly", 0)
+            lw = item.get("lw", 0)
+            lh = item.get("lh", 0)
+            # Add small padding around the text
+            painter.drawRoundedRect(QRectF(lx - 3, ly - 2, lw + 6, lh + 4), 3, 3)
+
+
+# ----------------------------------------------------------------------
+# Application Controller & Worker
+# ----------------------------------------------------------------------
+class ScanWorker(QThread):
+    finished_scan = pyqtSignal(list, float)
+    status_changed = pyqtSignal(str, bool)
+
+    def __init__(self, rect: QRect, dpr: float):
+        super().__init__()
+        self.rect = rect
+        self.dpr = dpr
 
     def run(self):
+        self.status_changed.emit("Scanning...", False)
         try:
-            lines = read_screen(self.roi.x(), self.roi.y(),
-                                self.roi.width(), self.roi.height(),
-                                lang=OCR_LANG, min_conf=OCR_MIN_CONF)
-            items: List[dict] = []
-            for line in lines:
-                if not line.text.strip():
-                    continue
-                result = solve_line(line.text)
-                items.append({
-                    "text": result["expression"] if result else line.text.strip(),
-                    "rect": (line.left, line.top, line.width, line.height),
-                    "solution": result["solution"] if result else None,
-                    "kind": result["kind"] if result else None,
-                })
-            self.signals.done.emit(self.roi, items)
+            img = capture_screen_roi(
+                self.rect.x(), self.rect.y(), self.rect.width(), self.rect.height(), dpr=self.dpr
+            )
+            blocks = extract_math_blocks(img)
+
+            solved_count = 0
+            for block in blocks:
+                sol = solve_locally(block["text"])
+                block["solution"] = sol
+                if sol.get("is_solved"):
+                    solved_count += 1
+
+            self.status_changed.emit(f"{solved_count}/{len(blocks)} solved locally", False)
+            self.finished_scan.emit(blocks, self.dpr)
+
+        except pytesseract.TesseractNotFoundError:
+            self.status_changed.emit("Tesseract not found! Click 'Browse...' in Control Panel", True)
+            self.finished_scan.emit([], self.dpr)
         except Exception as e:
-            traceback.print_exc()
-            self.signals.error.emit(str(e))
+            err = str(e)
+            if "tesseract is not installed" in err.lower():
+                self.status_changed.emit("Tesseract not found! Click 'Browse...' in Control Panel", True)
+            else:
+                self.status_changed.emit(f"Error: {err[:35]}", True)
+            self.finished_scan.emit([], self.dpr)
 
 
 class HotkeyBridge(QObject):
     triggered = pyqtSignal()
 
 
-# ============================================================== CONTROLLER
-class App(QObject):
-    def __init__(self, qapp: QApplication):
-        super().__init__()
-        self.qapp = qapp
-        self.pool = QThreadPool.globalInstance()
-
+class MathLensApp:
+    def __init__(self):
         self.frame = CaptureFrame()
-        self.panel = ControlPanel()
-        self.overlay = OverlayManager(on_click=self._show_details)
+        self.panel = ControlPanelWindow()
+        self.overlay = HUDOverlay()
+        self.worker = None
 
-        self.frame.roi_changed.connect(self.overlay.set_roi)
-        self.panel.scan_requested.connect(self.start_scan)
-        self.panel.auto_changed.connect(self._on_auto_changed)
-        self.panel.hotkey_changed.connect(self._register_hotkey)
-        self.panel.quit_requested.connect(self.qapp.quit)
+        screen = QApplication.primaryScreen()
+        self.dpr = screen.devicePixelRatio() if screen else 1.0
 
-        self._auto_timer = QTimer(self)
-        self._auto_timer.timeout.connect(self.start_scan)
+        self.timer = QTimer()
+        self.timer.timeout.connect(self.trigger_scan)
 
-        self._hotkey_handle = None
-        self._bridge = HotkeyBridge()
-        self._bridge.triggered.connect(self.start_scan)
-        self._register_hotkey(DEFAULT_HOTKEY)
+        self.frame.region_changed.connect(self.overlay.sync_with_roi)
+        self.overlay.sync_with_roi(self.frame.get_capture_rect())
 
-        self.frame.show()
+        self.panel.scan_requested.connect(self.trigger_scan)
+        self.panel.auto_scan_toggled.connect(self.on_auto_scan)
+        self.panel.hotkey_changed.connect(self.setup_hotkey)
+        self.panel.toggle_frame_requested.connect(self.toggle_frame)
+        self.frame.close_clicked.connect(self.toggle_frame)
+
+        self.hotkey_bridge = HotkeyBridge()
+        self.hotkey_bridge.triggered.connect(self.trigger_scan)
+        self.setup_hotkey(DEFAULT_HOTKEY)
+
         self.panel.show()
+        self.frame.show()
 
-        if not _TESS_PATH:
-            self.panel.set_status("Tesseract not found - install or browse")
+    def toggle_frame(self):
+        if self.frame.isVisible():
+            self.frame.hide()
+            self.overlay.hide()
         else:
-            self.panel.set_status("Ready")
+            self.frame.show()
+            self.overlay.sync_with_roi(self.frame.get_capture_rect())
 
-    # --------------------------------------------------------- hotkey
-    def _register_hotkey(self, hk: str):
-        if not _HAS_KEYBOARD:
-            self.panel.set_status("keyboard module unavailable")
+    def trigger_scan(self):
+        if self.worker and self.worker.isRunning():
             return
-        try:
-            if self._hotkey_handle is not None:
-                keyboard.remove_hotkey(self._hotkey_handle)
-            self._hotkey_handle = keyboard.add_hotkey(
-                hk, self._bridge.triggered.emit)
-        except Exception as e:
-            QMessageBox.warning(
-                self.panel, "Hotkey",
-                f"Failed to register '{hk}':\n{e}\n"
-                "Try running as administrator (Windows) or with sudo (Linux).")
+        screen = QApplication.primaryScreen()
+        self.dpr = screen.devicePixelRatio() if screen else 1.0
+        self.worker = ScanWorker(self.frame.get_capture_rect(), self.dpr)
+        self.worker.finished_scan.connect(self.overlay.display_results)
+        self.worker.status_changed.connect(self.panel.set_status)
+        self.worker.start()
 
-    # --------------------------------------------------------- auto
-    def _on_auto_changed(self, enabled: bool, interval: int):
-        self._auto_timer.stop()
+    def on_auto_scan(self, enabled: bool, interval: int):
         if enabled:
-            self._auto_timer.start(max(1, interval) * 1000)
-            self.panel.set_status(f"Auto every {interval}s")
+            self.timer.start(interval * 1000)
+            self.panel.set_status("Auto-Scan Active", False)
         else:
-            self.panel.set_status("Ready")
+            self.timer.stop()
+            self.panel.set_status("Ready", False)
 
-    # --------------------------------------------------------- scan
-    def start_scan(self):
-        if not _TESS_PATH:
-            self.panel.set_status("Tesseract not found")
-            QMessageBox.warning(
-                self.panel, "Tesseract",
-                "Tesseract OCR is not installed or not in PATH.\n\n"
-                "Windows: install from https://github.com/UB-Mannheim/tesseract/wiki\n"
-                "macOS: brew install tesseract tesseract-lang\n"
-                "Linux: sudo apt install tesseract-ocr tesseract-ocr-ukr\n\n"
-                "Or click 'Browse' in the panel to point to tesseract executable.")
-            return
-
-        roi = self.frame.roi_rect()
-        if roi.width() < 30 or roi.height() < 20:
-            self.panel.set_status("Frame too small")
-            return
-        self.panel.set_status("Scanning...")
-        task = ScanTask(roi)
-        task.signals.done.connect(self._on_scan_done)
-        task.signals.error.connect(self._on_scan_error)
-        self.pool.start(task)
-
-    def _on_scan_done(self, roi: QRect, items: List[dict]):
-        self.overlay.show_items(roi, items)
-        solved = sum(1 for it in items if it.get("solution"))
-        if not items:
-            self.panel.set_status("Nothing found")
-        else:
-            self.panel.set_status(f"{solved}/{len(items)} solved locally")
-
-    def _on_scan_error(self, msg: str):
-        self.panel.set_status("Error")
-        QMessageBox.warning(self.panel, "Scan error", msg)
-
-    def _show_details(self, item: dict):
-        dlg = DetailDialog(item, parent=None)
-        dlg.show(); dlg.exec()
+    def setup_hotkey(self, key: str):
+        try:
+            keyboard.clear_all_hotkeys()
+            keyboard.add_hotkey(key, lambda: self.hotkey_bridge.triggered.emit())
+            self.panel.set_status(f"Hotkey: {key}", False)
+        except Exception:
+            self.panel.set_status("Hotkey Inactive", True)
 
 
-# ============================================================== ENTRY
 def main():
     app = QApplication(sys.argv)
-    app.setApplicationName("MathLens")
-    controller = App(app)   # noqa: F841
+    _ = MathLensApp()
     sys.exit(app.exec())
 
 
