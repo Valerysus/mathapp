@@ -1,17 +1,24 @@
 """
-MathLens v5 - Smart Math OCR, Local Equation Solver & Adaptive AI Explainer
-- Strict text filtering (ignores instruction sentences, numbers with dots, text paragraphs)
-- High-precision column-aware expression detection (splits multiple equations on one row)
-- Cyrillic math variable mapping (х -> x, у -> y, а -> a, : -> /)
-- Visual Bounding Boxes around detected problems
-- Local answer badge + separate [ ⚡ AI ] button
-- Adaptive AI explanation difficulty (Elementary, Medium, Advanced)
-- Dual-window architecture (Capture Frame + Taskbar Control Panel)
+MathLens - Photomath for Desktop
+PyQt6 + Tesseract OCR + SymPy + Gemini Vision & AI Solver
+
+Features:
+- Dual-Window Architecture: Frameless Transparent ROI Frame + Standalone Control Panel
+- Strict Math Filtering: Ignores text paragraphs, headers, and exercise labels
+- Column-Aware Equation Extraction: Solves multiple problems on the same line
+- Offline Local Solver: SymPy with Cyrillic variable conversion (x, y, a, b, etc.)
+- Multi-modal Gemini Vision Mode: Direct screenshot-to-math for handwriting, fractions, geometry
+- Full Screen Capture toggle
+- In-HUD Bounding Box Outlines + Answer Badge + Round [ ? ] Step-by-Step Button
+- Control Panel Results List: Scrollable overview of all detected equations and solutions
+- In-Memory Response Caching: Eliminates redundant API calls and token waste
 """
 
 import os
 import sys
 import re
+import io
+import json
 import shutil
 from pathlib import Path
 
@@ -28,7 +35,7 @@ import keyboard
 from dotenv import load_dotenv
 
 from PyQt6.QtCore import Qt, QPoint, QRect, QRectF, pyqtSignal, QThread, QTimer, QObject
-from PyQt6.QtGui import QPainter, QPen, QColor, QBrush, QCursor, QFont
+from PyQt6.QtGui import QPainter, QPen, QColor, QBrush, QCursor
 from PyQt6.QtWidgets import (
     QApplication,
     QMainWindow,
@@ -44,20 +51,28 @@ from PyQt6.QtWidgets import (
     QTextBrowser,
     QFileDialog,
     QFrame,
+    QListWidget,
+    QListWidgetItem,
+    QSplitter,
 )
 
 # ----------------------------------------------------------------------
-# Configuration & Auto-Detection
+# Configuration & Security (No Hardcoded Fallbacks)
 # ----------------------------------------------------------------------
 ENV_PATH = Path(__file__).resolve().parent / ".env"
 load_dotenv(dotenv_path=ENV_PATH)
 
+# Strictly read from environment - never hardcode secrets
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+
 DEFAULT_HOTKEY = os.getenv("HOTKEY", "F8").strip() or "F8"
 DEFAULT_INTERVAL = int(os.getenv("AUTO_INTERVAL_S", "3"))
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash").strip()
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash").strip() or "gemini-2.0-flash"
 GEMINI_FALLBACK_MODEL = "gemini-1.5-flash"
 OCR_LANG = os.getenv("OCR_LANG", "eng+ukr").strip()
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "AQ.Ab8RN6JSN12zl5DZ5p7ELzRtAy2Yx65DXP7PWYuAq9jWBg_ivg").strip()
+
+# Global in-memory cache to save API quota and network time
+EXPLANATION_CACHE = {}
 
 
 def find_tesseract_cmd() -> str:
@@ -142,9 +157,6 @@ def normalize_math_symbols(raw_text: str) -> str:
 
 
 def solve_locally(expr_str: str) -> dict:
-    """
-    Solves arithmetic and algebraic equations locally using SymPy.
-    """
     cleaned = normalize_math_symbols(expr_str)
     if cleaned.endswith("="):
         cleaned = cleaned[:-1].strip()
@@ -175,8 +187,7 @@ def solve_locally(expr_str: str) -> dict:
                                 sol_strs.append(", ".join(str(item) for item in s))
                             else:
                                 sol_strs.append(f"{syms[0].name} = {s}")
-                        res = ", ".join(sol_strs)
-                        return {"is_solved": True, "result_str": res}
+                        return {"is_solved": True, "result_str": ", ".join(sol_strs)}
                     else:
                         return {"is_solved": True, "result_str": str(sols)}
                 else:
@@ -198,7 +209,6 @@ def solve_locally(expr_str: str) -> dict:
 
 
 def get_complexity_level(expr: str) -> tuple[str, str]:
-    """Determines math problem complexity for adaptive Gemini prompting."""
     e = expr.lower()
     if re.search(r"(sin|cos|tan|cot|log|ln|sqrt|\^3|\^[4-9])", e):
         return "Advanced", "Advanced difficulty: Provide a clear, thorough step-by-step mathematical proof/derivation."
@@ -224,23 +234,18 @@ def capture_screen_roi(x: int, y: int, width: int, height: int, dpr: float = 1.0
 
 
 def is_math_token(token: str) -> bool:
-    """Rejects general text words, task labels (e.g. 336.), and accepts math symbols."""
     t = token.strip()
     if not t:
         return False
 
-    # Ignore Cyrillic or Latin words with length >= 2 (like 'Розв\'яжи', 'рівняння', 'solve')
     if re.search(r"[a-zA-Zа-яіїєґА-ЯІЇЄҐ]{2,}", t):
-        # Allow known math functions
         if t.lower() in ("sqrt", "sin", "cos", "tan", "log", "ln"):
             return True
         return False
 
-    # Ignore numbered list markers like '336.', '1)', '2.'
     if re.match(r"^\d+[\.\)]$", t):
         return False
 
-    # Accept numbers, operators, single-character variables
     if re.search(r"[\d\+\-\*\/\:\·\•\×\=\^\(\)]", t):
         return True
     if re.match(r"^[a-zA-Zа-яіїєґ]$", t):
@@ -250,8 +255,6 @@ def is_math_token(token: str) -> bool:
 
 
 def is_valid_math_expression(expr_str: str) -> bool:
-    """Verifies that an assembled token group represents a real math problem."""
-    # Must have at least one digit or two distinct variables
     has_digit = bool(re.search(r"\d", expr_str))
     has_operator = bool(re.search(r"[\+\-\*\/\:\·\•\×\=\^]", expr_str))
     if not has_operator:
@@ -309,14 +312,11 @@ def extract_math_blocks(image: Image.Image, min_conf: int = 15) -> list[dict]:
 
     results = []
 
-    # Process each line, splitting multiple equations separated by columns/large gaps
     for _, tokens in lines_dict.items():
         if not tokens:
             continue
 
-        # Sort tokens horizontally
         tokens.sort(key=lambda item: item["l"])
-
         groups = []
         cur_group = []
 
@@ -330,7 +330,6 @@ def extract_math_blocks(image: Image.Image, min_conf: int = 15) -> list[dict]:
             avg_h = max(12, prev["b"] - prev["t"])
             has_equals = any(t["text"] == "=" for t in cur_group)
 
-            # Split if there is a column gap (> 25px or 1.4x line height) or a second '=' sign
             if gap > max(24, avg_h * 1.4) or (has_equals and tok["text"] == "="):
                 groups.append(cur_group)
                 cur_group = [tok]
@@ -360,7 +359,7 @@ def extract_math_blocks(image: Image.Image, min_conf: int = 15) -> list[dict]:
 
 
 # ----------------------------------------------------------------------
-# Adaptive Gemini AI Explainer
+# Gemini Client & Vision / Text AI Explainer with In-Memory Caching
 # ----------------------------------------------------------------------
 _gemini_client = None
 _gemini_type = None
@@ -373,7 +372,7 @@ def get_gemini_client():
 
     api_key = os.getenv("GEMINI_API_KEY", "").strip() or GEMINI_API_KEY
     if not api_key:
-        raise ValueError("GEMINI_API_KEY is not configured.")
+        raise ValueError("GEMINI_API_KEY is not set. Please add it to your .env file.")
 
     try:
         from google import genai
@@ -392,19 +391,20 @@ def get_gemini_client():
     except ImportError:
         pass
 
-    raise ImportError("Please install google-genai or google-generativeai.")
+    raise ImportError("Gemini library not found. Run: pip install google-genai")
 
 
 def ask_gemini_explanation(expression: str) -> tuple[str, str]:
-    """
-    Returns (complexity_level, explanation_text) adapting depth to math level.
-    """
+    """Retrieves or queries Gemini for step-by-step solution, using cache."""
     level_name, level_instruction = get_complexity_level(expression)
+
+    if expression in EXPLANATION_CACHE:
+        return level_name, EXPLANATION_CACHE[expression]
 
     try:
         client, ctype = get_gemini_client()
     except Exception as e:
-        return level_name, f"AI Setup Error: {str(e)}"
+        return level_name, f"AI Setup: {str(e)}"
 
     prompt = (
         f"You are a math tutor. Explain the solution for: \"{expression}\".\n"
@@ -415,29 +415,120 @@ def ask_gemini_explanation(expression: str) -> tuple[str, str]:
         "Language: Ukrainian (or English if formula only)."
     )
 
-    if ctype == "google-genai":
-        try:
-            resp = client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
-            return level_name, resp.text.strip() if resp.text else "No explanation."
-        except Exception:
+    result_text = "No explanation."
+    try:
+        if ctype == "google-genai":
             try:
+                resp = client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
+                result_text = resp.text.strip() if resp.text else result_text
+            except Exception:
                 resp = client.models.generate_content(model=GEMINI_FALLBACK_MODEL, contents=prompt)
-                return level_name, resp.text.strip() if resp.text else "No explanation."
-            except Exception as err:
-                return level_name, f"Gemini Error: {str(err)}"
-    elif ctype == "google-generativeai":
-        try:
+                result_text = resp.text.strip() if resp.text else result_text
+        elif ctype == "google-generativeai":
             model = client.GenerativeModel(GEMINI_FALLBACK_MODEL)
             resp = model.generate_content(prompt)
-            return level_name, resp.text.strip() if resp.text else "No explanation."
-        except Exception as err:
-            return level_name, f"Gemini Error: {str(err)}"
+            result_text = resp.text.strip() if resp.text else result_text
+    except Exception as err:
+        err_msg = str(err)
+        if "quota" in err_msg.lower() or "429" in err_msg:
+            result_text = "API Quota exceeded. Please check your Gemini plan or try again later."
+        elif "network" in err_msg.lower() or "connection" in err_msg.lower():
+            result_text = "Network connection error. Check your internet connection."
+        else:
+            result_text = f"Gemini Error: {err_msg[:60]}"
 
-    return level_name, "Unknown client error."
+    EXPLANATION_CACHE[expression] = result_text
+    return level_name, result_text
+
+
+def ask_gemini_vision(image: Image.Image) -> list[dict]:
+    """
+    Photomath mode: Direct multimodal screenshot analysis.
+    Useful for handwriting, fractions, geometry, and complex formulas.
+    """
+    try:
+        client, ctype = get_gemini_client()
+    except Exception as e:
+        return [{"text": "Vision Error", "solution": {"is_solved": False, "result_str": str(e)[:30]}}]
+
+    buf = io.BytesIO()
+    image.save(buf, format="PNG")
+    img_bytes = buf.getvalue()
+
+    prompt = (
+        "You are an expert mathematical OCR and problem solver (like Photomath).\n"
+        "Analyze the provided image containing math problems (printed or handwritten).\n"
+        "For each math problem found:\n"
+        "1. Transcribe the expression/equation exactly.\n"
+        "2. Provide the concise final answer.\n"
+        "3. Provide brief 2-3 step explanation in Ukrainian.\n"
+        "Respond ONLY with a valid JSON array of objects with keys: \"expression\", \"answer\", \"steps\".\n"
+        'Example: [{"expression": "456 + x = 609", "answer": "x = 153", "steps": "x = 609 - 456 = 153"}]'
+    )
+
+    raw_response = ""
+    try:
+        if ctype == "google-genai":
+            from google.genai import types
+            resp = client.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=[
+                    types.Part.from_bytes(data=img_bytes, mime_type="image/png"),
+                    prompt,
+                ],
+            )
+            raw_response = resp.text.strip() if resp.text else ""
+        elif ctype == "google-generativeai":
+            model = client.GenerativeModel(GEMINI_FALLBACK_MODEL)
+            resp = model.generate_content([image, prompt])
+            raw_response = resp.text.strip() if resp.text else ""
+    except Exception as e:
+        return [{"text": "Vision Error", "solution": {"is_solved": False, "result_str": str(e)[:30]}}]
+
+    # Parse JSON from response
+    parsed_results = []
+    try:
+        # Strip markdown code fences if present
+        clean_json = re.sub(r"^```[a-zA-Z]*\s*", "", raw_response)
+        clean_json = re.sub(r"\s*```$", "", clean_json).strip()
+        data = json.loads(clean_json)
+
+        for i, item in enumerate(data):
+            expr = item.get("expression", f"Problem #{i+1}")
+            ans = item.get("answer", "")
+            steps = item.get("steps", "")
+            if steps:
+                EXPLANATION_CACHE[expr] = f"**Answer:** {ans}\n\n**Steps:**\n{steps}"
+
+            parsed_results.append({
+                "text": expr,
+                "x": 30,
+                "y": 40 + i * 50,
+                "w": 180,
+                "h": 30,
+                "solution": {
+                    "is_solved": True if ans else False,
+                    "result_str": ans if ans else "Needs AI",
+                }
+            })
+    except Exception:
+        # Fallback if model returned plain text instead of JSON
+        if raw_response:
+            parsed_results.append({
+                "text": "Vision Solution",
+                "x": 30,
+                "y": 40,
+                "w": 200,
+                "h": 30,
+                "solution": {"is_solved": True, "result_str": "Check [?]"}
+            })
+            EXPLANATION_CACHE["Vision Solution"] = raw_response
+
+    return parsed_results
 
 
 # ----------------------------------------------------------------------
-# GUI: Window 1 (Pure Transparent Capture ROI Frame)
+# GUI: Window 1 (Pure Transparent Capture Frame)
 # ----------------------------------------------------------------------
 class CaptureFrame(QWidget):
     region_changed = pyqtSignal(QRect)
@@ -465,7 +556,7 @@ class CaptureFrame(QWidget):
         top_layout = QHBoxLayout(top_bar)
         top_layout.setContentsMargins(8, 2, 8, 2)
 
-        lbl_drag = QLabel("⠿ ROI FRAME (drag here to move)", top_bar)
+        lbl_drag = QLabel("⠿ ROI FRAME (drag to move)", top_bar)
         lbl_drag.setStyleSheet("color: #000000; font-size: 11px; font-weight: bold;")
         lbl_drag.setCursor(QCursor(Qt.CursorShape.SizeAllCursor))
         top_layout.addWidget(lbl_drag)
@@ -515,7 +606,6 @@ class CaptureFrame(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
 
-        # Header bar (solid white strip)
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(QBrush(QColor("#ffffff")))
         painter.drawRect(
@@ -525,7 +615,6 @@ class CaptureFrame(QWidget):
             self.top_bar.height(),
         )
 
-        # Subtle dark scrim
         painter.setBrush(QBrush(QColor(0, 0, 0, 15)))
         pen = QPen(QColor("#ffffff"), self.border_width)
         painter.setPen(pen)
@@ -604,10 +693,12 @@ class CaptureFrame(QWidget):
 
 
 # ----------------------------------------------------------------------
-# GUI: Window 2 (Control Panel with Windows Taskbar Presence)
+# GUI: Window 2 (Control Panel with Results List & Fullscreen Toggle)
 # ----------------------------------------------------------------------
 class ControlPanelWindow(QMainWindow):
     scan_requested = pyqtSignal()
+    vision_scan_requested = pyqtSignal()
+    fullscreen_requested = pyqtSignal()
     auto_scan_toggled = pyqtSignal(bool, int)
     hotkey_changed = pyqtSignal(str)
     toggle_frame_requested = pyqtSignal()
@@ -615,7 +706,7 @@ class ControlPanelWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("MathLens - Control Panel")
-        self.resize(440, 320)
+        self.resize(460, 480)
         self.setStyleSheet("""
             QMainWindow, QWidget { background-color: #121212; color: #ffffff; font-family: 'Segoe UI', Arial; font-size: 12px; }
             QFrame.card { background-color: #1c1c1c; border: 1px solid #333333; border-radius: 6px; }
@@ -629,32 +720,52 @@ class ControlPanelWindow(QMainWindow):
             QSlider::handle:horizontal { background: #ffffff; width: 14px; margin: -5px 0; border-radius: 7px; }
             QCheckBox::indicator { width: 16px; height: 16px; border: 1px solid #555555; background: #181818; }
             QCheckBox::indicator:checked { background: #ffffff; }
+            QListWidget { background-color: #161616; border: 1px solid #333333; border-radius: 4px; padding: 4px; }
+            QListWidget::item { border-bottom: 1px solid #222222; padding: 2px; }
         """)
 
         central = QWidget()
         self.setCentralWidget(central)
         layout = QVBoxLayout(central)
         layout.setContentsMargins(16, 16, 16, 16)
-        layout.setSpacing(12)
+        layout.setSpacing(10)
 
+        # Action Buttons
         card_act = QFrame()
         card_act.setProperty("class", "card")
         act_l = QHBoxLayout(card_act)
-        self.btn_scan = QPushButton(f"Analyze Now ({DEFAULT_HOTKEY})")
+        act_l.setContentsMargins(8, 8, 8, 8)
+        act_l.setSpacing(6)
+
+        self.btn_scan = QPushButton(f"Analyze ({DEFAULT_HOTKEY})")
         self.btn_scan.setProperty("class", "primary")
         self.btn_scan.setFixedHeight(34)
         self.btn_scan.clicked.connect(self.scan_requested.emit)
         act_l.addWidget(self.btn_scan)
 
-        self.btn_toggle = QPushButton("Hide/Show Frame")
+        self.btn_vision = QPushButton("📷 Vision AI")
+        self.btn_vision.setToolTip("Direct multimodal recognition for handwriting, fractions, and geometry")
+        self.btn_vision.setFixedHeight(34)
+        self.btn_vision.clicked.connect(self.vision_scan_requested.emit)
+        act_l.addWidget(self.btn_vision)
+
+        self.btn_fullscreen = QPushButton("Full Screen")
+        self.btn_fullscreen.setFixedHeight(34)
+        self.btn_fullscreen.clicked.connect(self.fullscreen_requested.emit)
+        act_l.addWidget(self.btn_fullscreen)
+
+        self.btn_toggle = QPushButton("Hide Frame")
         self.btn_toggle.setFixedHeight(34)
         self.btn_toggle.clicked.connect(self.toggle_frame_requested.emit)
         act_l.addWidget(self.btn_toggle)
+
         layout.addWidget(card_act)
 
+        # Status Row
         card_st = QFrame()
         card_st.setProperty("class", "card")
         st_l = QHBoxLayout(card_st)
+        st_l.setContentsMargins(8, 6, 8, 6)
         st_l.addWidget(QLabel("Status:"))
         self.lbl_status = QLabel("Ready")
         self.lbl_status.setStyleSheet("font-weight: bold; color: #ffffff;")
@@ -662,20 +773,27 @@ class ControlPanelWindow(QMainWindow):
         st_l.addStretch()
         layout.addWidget(card_st)
 
+        # Results List Panel
+        layout.addWidget(QLabel("Detected Math Problems (Overview):"))
+        self.list_results = QListWidget()
+        layout.addWidget(self.list_results, stretch=1)
+
+        # Settings Section
         card_set = QFrame()
         card_set.setProperty("class", "card")
         set_l = QVBoxLayout(card_set)
-        set_l.setSpacing(10)
+        set_l.setContentsMargins(8, 8, 8, 8)
+        set_l.setSpacing(8)
 
         row1 = QHBoxLayout()
         row1.addWidget(QLabel("Hotkey:"))
         self.txt_hotkey = QLineEdit(DEFAULT_HOTKEY)
-        self.txt_hotkey.setFixedWidth(50)
+        self.txt_hotkey.setFixedWidth(45)
         self.txt_hotkey.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.txt_hotkey.editingFinished.connect(lambda: self.hotkey_changed.emit(self.txt_hotkey.text().strip().upper()))
         row1.addWidget(self.txt_hotkey)
 
-        row1.addSpacing(20)
+        row1.addSpacing(15)
         self.chk_auto = QCheckBox("Auto-Scan")
         self.chk_auto.toggled.connect(lambda c: self.auto_scan_toggled.emit(c, self.slider.value()))
         row1.addWidget(self.chk_auto)
@@ -683,7 +801,7 @@ class ControlPanelWindow(QMainWindow):
         self.slider = QSlider(Qt.Orientation.Horizontal)
         self.slider.setRange(1, 10)
         self.slider.setValue(DEFAULT_INTERVAL)
-        self.slider.setFixedWidth(80)
+        self.slider.setFixedWidth(70)
         self.slider.valueChanged.connect(self._on_slider)
         row1.addWidget(self.slider)
 
@@ -691,22 +809,21 @@ class ControlPanelWindow(QMainWindow):
         row1.addWidget(self.lbl_interval)
         set_l.addLayout(row1)
 
-        row2 = QVBoxLayout()
-        row2.addWidget(QLabel("Tesseract Path (tesseract.exe):"))
-        p_box = QHBoxLayout()
+        # Tesseract browse
+        row2 = QHBoxLayout()
+        row2.addWidget(QLabel("Tesseract:"))
         self.txt_tess = QLineEdit(TESSERACT_CMD)
-        self.txt_tess.setPlaceholderText("Select tesseract.exe path...")
-        p_box.addWidget(self.txt_tess)
+        self.txt_tess.setPlaceholderText("Select tesseract.exe...")
+        row2.addWidget(self.txt_tess)
 
         self.btn_browse = QPushButton("Browse...")
         self.btn_browse.clicked.connect(self._browse_tess)
-        p_box.addWidget(self.btn_browse)
-        row2.addLayout(p_box)
+        row2.addWidget(self.btn_browse)
         set_l.addLayout(row2)
 
         layout.addWidget(card_set)
-        layout.addStretch()
 
+        # Footer
         foot = QHBoxLayout()
         btn_quit = QPushButton("Quit Application")
         btn_quit.clicked.connect(QApplication.instance().quit)
@@ -728,7 +845,59 @@ class ControlPanelWindow(QMainWindow):
         if path:
             self.txt_tess.setText(path)
             save_tesseract_cmd(path)
-            self.set_status("Tesseract path updated!", False)
+            self.set_status("Tesseract path saved!", False)
+
+    def populate_results_list(self, items: list[dict]):
+        self.list_results.clear()
+        if not items:
+            item_w = QListWidgetItem("No mathematical expressions found.")
+            item_w.setForeground(QColor("#777777"))
+            self.list_results.addItem(item_w)
+            return
+
+        for item in items:
+            row = QWidget()
+            row_l = QHBoxLayout(row)
+            row_l.setContentsMargins(6, 4, 6, 4)
+
+            lbl_expr = QLabel(item["text"])
+            lbl_expr.setStyleSheet("color: #ffffff; font-weight: bold; font-family: monospace;")
+            row_l.addWidget(lbl_expr, stretch=1)
+
+            res = item["solution"].get("result_str", "Needs AI")
+            lbl_ans = QLabel(f"[ {res} ]")
+            lbl_ans.setStyleSheet("color: #81c784; font-weight: bold; font-family: monospace;")
+            row_l.addWidget(lbl_ans)
+
+            btn_q = QPushButton("?")
+            btn_q.setToolTip("Show step-by-step solution")
+            btn_q.setFixedSize(22, 22)
+            btn_q.setStyleSheet("""
+                QPushButton {
+                    background-color: #242424;
+                    color: #ffffff;
+                    font-weight: bold;
+                    font-size: 13px;
+                    border: 1px solid #666666;
+                    border-radius: 11px;
+                }
+                QPushButton:hover {
+                    background-color: #ffffff;
+                    color: #000000;
+                    border: 1px solid #ffffff;
+                }
+            """)
+            btn_q.clicked.connect(
+                lambda _, e=item: ExplanationDialog(
+                    e["text"], e["solution"].get("result_str", ""), self
+                ).exec()
+            )
+            row_l.addWidget(btn_q)
+
+            list_item = QListWidgetItem(self.list_results)
+            list_item.setSizeHint(row.sizeHint())
+            self.list_results.addItem(list_item)
+            self.list_results.setItemWidget(list_item, row)
 
     def closeEvent(self, event):
         QApplication.instance().quit()
@@ -736,7 +905,7 @@ class ControlPanelWindow(QMainWindow):
 
 
 # ----------------------------------------------------------------------
-# GUI: Visual Bounding Boxes & Dual Badges (Answer + AI Button)
+# GUI: In-HUD Outlines, Answer Badges & Round [ ? ] Buttons
 # ----------------------------------------------------------------------
 class ExplanationDialog(QDialog):
     def __init__(self, expr: str, local_res: str, parent=None):
@@ -760,7 +929,7 @@ class ExplanationDialog(QDialog):
         header_box.addWidget(lbl_expr)
         header_box.addStretch()
 
-        self.lbl_diff = QLabel("Detecting...")
+        self.lbl_diff = QLabel("Determining...")
         self.lbl_diff.setStyleSheet("color: #aaaaaa; font-size: 11px; border: 1px solid #444; border-radius: 3px; padding: 2px 6px;")
         header_box.addWidget(self.lbl_diff)
         layout.addLayout(header_box)
@@ -771,7 +940,7 @@ class ExplanationDialog(QDialog):
             layout.addWidget(lbl_ans)
 
         self.browser = QTextBrowser()
-        self.browser.setMarkdown("Analyzing problem with Gemini AI...")
+        self.browser.setMarkdown("Requesting step-by-step solution from Gemini AI...")
         layout.addWidget(self.browser)
 
         foot = QHBoxLayout()
@@ -781,7 +950,6 @@ class ExplanationDialog(QDialog):
         foot.addWidget(btn_close)
         layout.addLayout(foot)
 
-        # Fetch adaptive explanation
         level_name, explanation = ask_gemini_explanation(expr)
         self.lbl_diff.setText(f"Level: {level_name}")
         self.browser.setMarkdown(explanation)
@@ -789,7 +957,7 @@ class ExplanationDialog(QDialog):
 
 class MathItemWidget(QWidget):
     """
-    Renders the local answer badge and a separate [ ⚡ AI ] button right next to it.
+    Renders Answer badge + round [ ? ] button.
     """
     def __init__(self, expr_text: str, result_info: dict, parent=None):
         super().__init__(parent)
@@ -803,7 +971,6 @@ class MathItemWidget(QWidget):
         layout.setSpacing(4)
 
         if is_solved:
-            # Answer badge
             self.lbl_ans = QLabel(f"[ {res_str} ]")
             self.lbl_ans.setStyleSheet("""
                 QLabel {
@@ -819,17 +986,18 @@ class MathItemWidget(QWidget):
             """)
             layout.addWidget(self.lbl_ans)
 
-            # Separate small AI button
-            self.btn_ai = QPushButton("⚡ AI")
-            self.btn_ai.setStyleSheet("""
+            # Sleek round [ ? ] button
+            self.btn_q = QPushButton("?")
+            self.btn_q.setToolTip("Show step-by-step solution")
+            self.btn_q.setFixedSize(22, 22)
+            self.btn_q.setStyleSheet("""
                 QPushButton {
                     background-color: #242424;
                     color: #ffffff;
-                    font-size: 11px;
                     font-weight: bold;
+                    font-size: 13px;
                     border: 1px solid #666666;
-                    border-radius: 3px;
-                    padding: 2px 6px;
+                    border-radius: 11px;
                 }
                 QPushButton:hover {
                     background-color: #ffffff;
@@ -837,13 +1005,12 @@ class MathItemWidget(QWidget):
                     border: 1px solid #ffffff;
                 }
             """)
-            self.btn_ai.setCursor(Qt.CursorShape.PointingHandCursor)
-            self.btn_ai.clicked.connect(self._open_dialog)
-            layout.addWidget(self.btn_ai)
+            self.btn_q.setCursor(Qt.CursorShape.PointingHandCursor)
+            self.btn_q.clicked.connect(self._open_dialog)
+            layout.addWidget(self.btn_q)
         else:
-            # Fallback button for complex problems
-            self.btn_ai = QPushButton("⚡ Solve with AI")
-            self.btn_ai.setStyleSheet("""
+            self.btn_solve = QPushButton("⚡ Solve with AI")
+            self.btn_solve.setStyleSheet("""
                 QPushButton {
                     background-color: #1a1a1a;
                     color: #ffffff;
@@ -858,9 +1025,9 @@ class MathItemWidget(QWidget):
                     color: #000000;
                 }
             """)
-            self.btn_ai.setCursor(Qt.CursorShape.PointingHandCursor)
-            self.btn_ai.clicked.connect(self._open_dialog)
-            layout.addWidget(self.btn_ai)
+            self.btn_solve.setCursor(Qt.CursorShape.PointingHandCursor)
+            self.btn_solve.clicked.connect(self._open_dialog)
+            layout.addWidget(self.btn_solve)
 
     def _open_dialog(self):
         dlg = ExplanationDialog(self.expr_text, self.result_info.get("result_str", ""), self.window())
@@ -868,10 +1035,6 @@ class MathItemWidget(QWidget):
 
 
 class HUDOverlay(QWidget):
-    """
-    Transparent HUD overlay that outlines math problems with bounding boxes
-    and positions Answer badges + AI buttons neatly around them.
-    """
     def __init__(self):
         super().__init__()
         self.setWindowFlags(
@@ -901,7 +1064,6 @@ class HUDOverlay(QWidget):
         self.items_data = items
 
         for item in items:
-            # Convert physical image pixels to Qt logical coordinates
             lx = int(item["x"] / dpr)
             ly = int(item["y"] / dpr)
             lw = int(item["w"] / dpr)
@@ -915,7 +1077,6 @@ class HUDOverlay(QWidget):
             widget = MathItemWidget(item["text"], item["solution"], self)
             widget.adjustSize()
 
-            # Place widget above the bounding box if space allows, otherwise below
             bw = widget.sizeHint().width()
             bh = widget.sizeHint().height()
 
@@ -934,14 +1095,12 @@ class HUDOverlay(QWidget):
         self.update()
 
     def paintEvent(self, event):
-        """Draws crisp bounding box outlines around every detected math expression."""
         if not self.items_data:
             return
 
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
 
-        # High-contrast rounded rectangle outline around the problem
         pen = QPen(QColor(255, 255, 255, 230), 1.5, Qt.PenStyle.SolidLine)
         brush = QBrush(QColor(0, 0, 0, 30))
         painter.setPen(pen)
@@ -952,28 +1111,38 @@ class HUDOverlay(QWidget):
             ly = item.get("ly", 0)
             lw = item.get("lw", 0)
             lh = item.get("lh", 0)
-            # Add small padding around the text
             painter.drawRoundedRect(QRectF(lx - 3, ly - 2, lw + 6, lh + 4), 3, 3)
 
 
 # ----------------------------------------------------------------------
-# Application Controller & Worker
+# Background Threads (Local OCR vs Direct Multimodal Vision)
 # ----------------------------------------------------------------------
 class ScanWorker(QThread):
     finished_scan = pyqtSignal(list, float)
     status_changed = pyqtSignal(str, bool)
 
-    def __init__(self, rect: QRect, dpr: float):
+    def __init__(self, rect: QRect, dpr: float, use_vision: bool = False):
         super().__init__()
         self.rect = rect
         self.dpr = dpr
+        self.use_vision = use_vision
 
     def run(self):
-        self.status_changed.emit("Scanning...", False)
+        mode_label = "Vision AI..." if self.use_vision else "Scanning..."
+        self.status_changed.emit(mode_label, False)
         try:
             img = capture_screen_roi(
                 self.rect.x(), self.rect.y(), self.rect.width(), self.rect.height(), dpr=self.dpr
             )
+
+            if self.use_vision:
+                # Direct Multimodal Gemini Vision
+                blocks = ask_gemini_vision(img)
+                self.status_changed.emit(f"Vision AI: {len(blocks)} items", False)
+                self.finished_scan.emit(blocks, self.dpr)
+                return
+
+            # Fast Local Tesseract OCR + SymPy
             blocks = extract_math_blocks(img)
 
             solved_count = 0
@@ -1002,12 +1171,18 @@ class HotkeyBridge(QObject):
     triggered = pyqtSignal()
 
 
+# ----------------------------------------------------------------------
+# Main Application Controller
+# ----------------------------------------------------------------------
 class MathLensApp:
     def __init__(self):
         self.frame = CaptureFrame()
         self.panel = ControlPanelWindow()
         self.overlay = HUDOverlay()
         self.worker = None
+
+        self.prev_geometry = None
+        self.is_fullscreen = False
 
         screen = QApplication.primaryScreen()
         self.dpr = screen.devicePixelRatio() if screen else 1.0
@@ -1019,6 +1194,8 @@ class MathLensApp:
         self.overlay.sync_with_roi(self.frame.get_capture_rect())
 
         self.panel.scan_requested.connect(self.trigger_scan)
+        self.panel.vision_scan_requested.connect(self.trigger_vision_scan)
+        self.panel.fullscreen_requested.connect(self.toggle_fullscreen)
         self.panel.auto_scan_toggled.connect(self.on_auto_scan)
         self.panel.hotkey_changed.connect(self.setup_hotkey)
         self.panel.toggle_frame_requested.connect(self.toggle_frame)
@@ -1031,23 +1208,52 @@ class MathLensApp:
         self.panel.show()
         self.frame.show()
 
+    def toggle_fullscreen(self):
+        if not self.is_fullscreen:
+            self.prev_geometry = self.frame.geometry()
+            # Get screen where cursor or frame currently resides
+            screen = QApplication.screenAt(QCursor.pos()) or QApplication.primaryScreen()
+            self.frame.setGeometry(screen.geometry())
+            self.is_fullscreen = True
+            self.panel.btn_fullscreen.setText("Windowed")
+        else:
+            if self.prev_geometry:
+                self.frame.setGeometry(self.prev_geometry)
+            else:
+                self.frame.resize(600, 320)
+            self.is_fullscreen = False
+            self.panel.btn_fullscreen.setText("Full Screen")
+        self.overlay.sync_with_roi(self.frame.get_capture_rect())
+
     def toggle_frame(self):
         if self.frame.isVisible():
             self.frame.hide()
             self.overlay.hide()
+            self.panel.btn_toggle.setText("Show Frame")
         else:
             self.frame.show()
             self.overlay.sync_with_roi(self.frame.get_capture_rect())
+            self.panel.btn_toggle.setText("Hide Frame")
 
     def trigger_scan(self):
+        self._start_scan_worker(use_vision=False)
+
+    def trigger_vision_scan(self):
+        self._start_scan_worker(use_vision=True)
+
+    def _start_scan_worker(self, use_vision: bool):
         if self.worker and self.worker.isRunning():
             return
         screen = QApplication.primaryScreen()
         self.dpr = screen.devicePixelRatio() if screen else 1.0
-        self.worker = ScanWorker(self.frame.get_capture_rect(), self.dpr)
-        self.worker.finished_scan.connect(self.overlay.display_results)
+        self.worker = ScanWorker(self.frame.get_capture_rect(), self.dpr, use_vision=use_vision)
+        self.worker.finished_scan.connect(self.on_scan_finished)
         self.worker.status_changed.connect(self.panel.set_status)
         self.worker.start()
+
+    def on_scan_finished(self, blocks: list[dict], dpr: float):
+        self.overlay.display_results(blocks, dpr)
+        self.panel.populate_results_list(blocks)
 
     def on_auto_scan(self, enabled: bool, interval: int):
         if enabled:
